@@ -17,7 +17,7 @@ from basis_arb.config import BacktestConfig
 from basis_arb.live import daemon as daemon_mod
 from basis_arb.live import history
 from basis_arb.live._http import HttpError
-from basis_arb.live.broker import PaperBroker
+from basis_arb.live.broker import BrokerError, PaperBroker, UnsupportedOnTestnet
 from basis_arb.live.daemon import Daemon, MissingCredentials, StartupRefused, main, run
 from basis_arb.live.feed import FeedError, LiveFeed, LiveQuote, append_live_row
 from basis_arb.live.state import (
@@ -26,6 +26,7 @@ from basis_arb.live.state import (
     Ledger,
     StateLock,
     StateLocked,
+    iso,
     state_paths,
     strategy_capital,
     to_ms,
@@ -143,9 +144,10 @@ FRED_CSV = ("observation_date,DTB3\n2026-08-03,3.70\n2026-09-10,3.90\n2026-09-11
 class FakePublic:
     """Stands in for _http.PublicClient: deterministic klines / funding / exchangeInfo / FRED by URL path."""
 
-    def __init__(self, now=H_NOW, fred_text=FRED_CSV, fred_error=False):
+    def __init__(self, now=H_NOW, fred_text=FRED_CSV, fred_error=False, spot_gaps=()):
         self.now_ms = to_ms(now)
         self.fred_text, self.fred_error = fred_text, fred_error
+        self.spot_gaps = [(to_ms(s), to_ms(s) + h * HOUR_MS) for s, h in spot_gaps]  # missing bar ENDS [s, s+h)
         self.calls: list[tuple[str, dict]] = []
 
     @staticmethod
@@ -168,6 +170,8 @@ class FakePublic:
         start = -(-start // HOUR_MS) * HOUR_MS
         rows = []
         for o in range(start, end + 1, HOUR_MS):
+            if path == "/api/v3/klines" and any(a <= o + HOUR_MS < b for a, b in self.spot_gaps):
+                continue  # exchange outage: no spot bar
             s = self.spot_px(o)
             if path == "/api/v3/klines":
                 px = s
@@ -239,11 +243,13 @@ def test_recent_panel_satisfies_the_contract_and_the_selection_rule():
     assert at("2026-09-25 08:00")["fut_cq_symbol"] == "BTCUSDT_261225" and at("2026-09-25 08:00")["fut_nq_symbol"] is None
     assert at("2026-09-25 09:00")["fut_nq_symbol"] == "BTCUSDT_270326"
     assert at("2026-09-25 07:00")["fut_cq_dte_days"] == pytest.approx(1 / 24)
-    # r_usd: observation date d applies from d 00:00 UTC (no look-ahead), blanks skipped
-    assert at("2026-09-09 23:00")["r_usd"] == pytest.approx(0.037)
-    assert at("2026-09-10 00:00")["r_usd"] == pytest.approx(0.039)
-    assert at("2026-10-14 23:00")["r_usd"] == pytest.approx(0.039)
+    # r_usd: the observation for date d applies from d + 1 00:00 UTC (publication lag), blanks skipped
+    assert at("2026-09-10 23:00")["r_usd"] == pytest.approx(0.037)
+    assert at("2026-09-11 00:00")["r_usd"] == pytest.approx(0.039)
+    assert at("2026-10-15 23:00")["r_usd"] == pytest.approx(0.039)
+    assert at("2026-10-16 00:00")["r_usd"] == pytest.approx(0.041)
     assert p["r_usd"].iloc[-1] == pytest.approx(0.041) and (p["y_coin"] == 0.0).all()
+    assert (p["spot_high"].notna() & p["perp_high"].notna()).all()  # no outage in this window
 
 
 def test_recent_panel_falls_back_on_fred_failure_with_a_warning(caplog):
@@ -258,6 +264,22 @@ def test_recent_panel_falls_back_on_fred_failure_with_a_warning(caplog):
 def test_recent_panel_refuses_an_unconfigured_coin():
     with pytest.raises(ValueError):
         history.recent_panel("DOGEUSDT", hours=24, client=FakePublic(), now=H_NOW)
+
+
+def test_recent_panel_outages_follow_the_grid_rule(caplog):
+    short = pd.Timestamp("2026-10-10 05:00", tz="UTC")  # 3 missing spot bars: forward-filled, high/low NaN
+    p = history.recent_panel(ROOT, hours=24 * 45, client=FakePublic(spot_gaps=[(short, 3)]), now=H_NOW)
+    validate_panel(p)  # complete 1h grid
+    gap = p.loc[short: short + pd.Timedelta(hours=2)]
+    assert len(p) == 24 * 45 and gap["spot_high"].isna().all() and gap["spot_low"].isna().all()
+    assert (gap["spot_close"] == p.loc[short - pd.Timedelta(hours=1), "spot_close"]).all()
+    assert signals.enrich(p, BacktestConfig()).loc[gap.index, "stale_bar"].all()  # the model blanks them
+    long = pd.Timestamp("2026-10-01 00:00", tz="UTC")  # 7 missing bars > 5h: the window starts after it
+    with caplog.at_level(logging.WARNING, logger="basis_arb.live.history"):
+        p2 = history.recent_panel(ROOT, hours=24 * 45, client=FakePublic(spot_gaps=[(long, 7)]), now=H_NOW)
+    validate_panel(p2)
+    assert p2.index[0] == long + pd.Timedelta(hours=7) and p2.index[-1] == H_NOW.floor("h")
+    assert any("outage" in r.getMessage() for r in caplog.records)
 
 
 # =============================================================================================
@@ -438,13 +460,18 @@ class FakeFunding:
                              "funding_time_ms": [x[3] for x in rows]}, index=idx)
 
 
+def closed_history(panel: pd.DataFrame, clock: Clock):
+    """history_fn stand-in: the bars of `panel` that have closed by the clock's time (no provisional row)."""
+    return lambda root: panel[panel.index <= clock().floor("h")]
+
+
 def fake_targets(monkeypatch, overrides: dict, fail: list | None = None):
     """Wrap the real signals.build_targets; override the LAST row of chosen strategies; optionally raise."""
     real = signals.build_targets
-    calls = []
+    calls: list[pd.Timestamp] = []
 
     def fake(panel, cfg, strategies=None):
-        calls.append(len(panel))
+        calls.append(panel.index[-1])
         if fail and fail[0] > 0:
             fail[0] -= 1
             raise RuntimeError("synthetic decision-path failure")
@@ -462,219 +489,322 @@ def fake_targets(monkeypatch, overrides: dict, fail: list | None = None):
     return calls
 
 
-def make_daemon(tmp_path, clock, feed, panel, strategies=("funding_carry",), funding=None, **kw) -> Daemon:
-    return Daemon(ROOT, "paper", cfg=BacktestConfig(), strategies=strategies, state_dir=tmp_path, feed=feed,
-                  broker=PaperBroker(), history_fn=lambda r: panel, funding_fn=funding or FakeFunding(),
-                  clock=clock, sleep_fn=lambda s: None, **kw)
+PANEL = make_panel(n_hours=24 * 46)  # closed bars from 2025-01-01 00:00 to 2025-02-15 23:00
+T0 = START + pd.Timedelta(hours=24 * 45 - 1)  # 2025-02-14 23:00, the last closed bar at the first loop
 
 
-def events(tmp_path, kind=None) -> list[dict]:
-    evs = Ledger(state_paths(tmp_path, ROOT).events).read()
+def make_daemon(tmp_path, clock, feed, panel=PANEL, strategies=("funding_carry",), funding=None, mode="paper",
+                broker=None, **kw) -> Daemon:
+    return Daemon(ROOT, mode, cfg=BacktestConfig(), strategies=strategies, state_dir=tmp_path, feed=feed,
+                  broker=broker or PaperBroker(), history_fn=closed_history(panel, clock),
+                  funding_fn=funding or FakeFunding(), clock=clock, sleep_fn=lambda s: None, **kw)
+
+
+def events(tmp_path, kind=None, mode="paper") -> list[dict]:
+    evs = Ledger(state_paths(tmp_path, ROOT, mode).events).read()
     return [e for e in evs if kind is None or e["kind"] == kind]
 
 
-PANEL_END = START + pd.Timedelta(hours=24 * 45 - 1)  # make_panel(n_hours=24*45) ends 2025-02-14 23:00
+def at_bar(bar, seconds=30):
+    return utc(bar) + pd.Timedelta(seconds=seconds)
 
 
-def test_entry_is_reconciled_to_fills_through_the_backtest_signal_path(tmp_path, monkeypatch):
+def test_decisions_use_closed_bars_only_through_the_backtest_signal_path(tmp_path, monkeypatch):
     assert daemon_mod.model_signals is signals  # the decision path IS model.signals (research/live parity)
     real, seen = signals.build_targets, []
     monkeypatch.setattr(daemon_mod.model_signals, "build_targets",
                         lambda panel, cfg, strategies=None: seen.append(panel.index[-1]) or real(panel, cfg, strategies))
-    panel = make_panel(n_hours=24 * 45, funding_per_period=0.0003)  # trailing funding >> hurdle -> S2 target +1
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
+    panel = make_panel(n_hours=24 * 46, funding_per_period=0.0003)  # trailing funding >> hurdle -> S2 target +1
+    clock, feed = Clock(at_bar(T0, 37 * 60)), FakeFeed()  # 37 minutes into the hour ending at T0 + 1h
     feed.quote = mkquote(clock())
     out: list[str] = []
     st = run(ROOT, "paper", once=True, strategies=("funding_carry",), state_dir=tmp_path, feed=feed,
-             broker=PaperBroker(), history_fn=lambda r: panel, funding_fn=FakeFunding(), clock=clock,
+             broker=PaperBroker(), history_fn=closed_history(panel, clock), funding_fn=FakeFunding(), clock=clock,
              sleep_fn=lambda s: None, out=out.append)
-    assert seen == [PANEL_END + pd.Timedelta(hours=1)]  # signals ran on the panel + the live row
-    assert st["signals"]["funding_carry"]["target"] == 1 and st["decision_loop"] and not st["halted"]
+    assert seen == [T0]  # decided on the last CLOSED bar, not on the provisional row (T0 + 1h)
+    assert st["live_row_ts"] == T0 + pd.Timedelta(hours=1)  # the provisional row exists, for marks only
+    assert st["signals"]["funding_carry"]["target"] == 1 and st["decision_bar"] == T0 and not st["halted"]
     fills = events(tmp_path, "FILL")
     assert [(f["leg"], f["side"], f["reason"]) for f in fills] == [("spot", "buy", "ENTER"), ("perp", "sell", "ENTER")]
     assert fills[0]["qty"] == pytest.approx(10_000 / 50_000.0) == pytest.approx(fills[1]["qty"])
     assert fills[0]["price"] == pytest.approx(50_000.5 * 1.0002) and fills[1]["price"] == pytest.approx(49_999.5 * 0.9998)
-    dec = events(tmp_path, "DECISION")
-    assert len(dec) == 1 and dec[0]["strategies"]["funding_carry"]["action"] == "ENTER"
-    book = Book.load(state_paths(tmp_path, ROOT).book)
+    (dec,) = events(tmp_path, "DECISION")
+    assert dec["bar"] == iso(T0) and dec["strategies"]["funding_carry"]["action"] == "ENTER"
+    book = Book.load(state_paths(tmp_path, ROOT, "paper").book)
     assert book.strategies["funding_carry"].target == 1 and len(book.strategies["funding_carry"].positions) == 2
-    assert "basis_arb live | BTCUSDT | paper" in out[0] and "funding_carry" in out[0]
-    kinds = [e["kind"] for e in events(tmp_path)]
-    assert kinds[0] == "HEARTBEAT" and {"SNAPSHOT", "DECISION", "FILL"} <= set(kinds) and kinds[-1] == "HEARTBEAT"
+    assert "basis_arb live | BTCUSDT | paper" in out[0] and "decision input" in out[0]
 
 
-def test_decides_once_per_bar(tmp_path, monkeypatch):
+def test_replay_of_closed_bars_matches_build_targets(tmp_path, monkeypatch):
+    """48 hourly rows (make_panel semantics), fed to the daemon one closed bar per hour: the adopted
+    (target, contract) per strategy equals model.signals.build_targets on the same closed bars."""
+    p = make_panel(n_hours=48, basis_ann_cq=0.30, basis_ann_nq=0.30, perp_premium=0.006)
+    spot = p["spot_close"]
+    rich_basis = (p.index < p.index[20]) | ((p.index >= p.index[30]) & (p.index < p.index[40]))
+    for col, mult in (("close", 1.0), ("high", 1.001), ("low", 0.999)):  # S1: basis below fair outside the windows
+        fair = spot * np.exp(0.02 * p["fut_cq_dte_days"] / 365.0) * mult
+        p.loc[~rich_basis, f"fut_cq_{col}"] = fair[~rich_basis]
+    rich_prem = (p.index < p.index[12]) | (p.index >= p.index[25])
+    for col, mult in (("close", 1.0), ("high", 1.001), ("low", 0.999)):  # S4: premium only in two windows
+        p.loc[~rich_prem, f"perp_{col}"] = spot[~rich_prem] * mult
+    validate_panel(p)
+    strategies = ("cash_and_carry", "random_maturity", "funding_carry", "calendar")
+    expected = signals.build_targets(p, BacktestConfig(), strategies)
+
+    clock, feed, funding = Clock(at_bar(p.index[0])), FakeFeed(), FakeFunding()
+    funding.prints = [(ts, float(r), 50_000.0) for ts, r in p["funding_rate"].dropna().items()]
+    got = {n: [] for n in strategies}
+    with make_daemon(tmp_path, clock, feed, panel=p, strategies=strategies, funding=funding) as d:
+        for i, bar in enumerate(p.index):
+            clock.set(at_bar(bar))
+            row = p.iloc[i]
+            feed.quote = mkquote(clock(), spot=float(row["spot_close"]), perp=float(row["perp_close"]),
+                                 cq=("SYN_CQ", float(row["fut_cq_close"]), CQ_EXP),
+                                 nq=("SYN_NQ", float(row["fut_nq_close"]), NQ_EXP))
+            st = d.step()
+            assert st["decision_bar"] == bar and len(d.closed) == i + 1  # one new closed bar per loop
+            for n in strategies:
+                sb = d.book.strategies[n]
+                got[n].append((sb.signal_target, sb.signal_contract))
+    for n in strategies:
+        want = [(int(t), c if isinstance(c, str) else None)
+                for t, c in zip(expected[n]["target"], expected[n]["contract"])]
+        assert got[n] == want, n
+    # the replay is not trivial: S1 and S4 enter and exit inside the 48 bars
+    for n in ("cash_and_carry", "random_maturity"):
+        reasons = set(expected[n]["reason"])
+        assert {"ENTER", "EXIT"} <= reasons, (n, reasons)
+    assert {e["kind"] for e in events(tmp_path)} >= {"DECISION", "FILL", "FUNDING_ACCRUAL"}
+
+
+def test_decides_once_per_closed_bar(tmp_path, monkeypatch):
     overrides = {"funding_carry": (1, None)}
-    fake_targets(monkeypatch, overrides)
-    panel = make_panel(n_hours=24 * 45)
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with make_daemon(tmp_path, clock, feed, panel) as d:
+    calls = fake_targets(monkeypatch, overrides)
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed) as d:
         feed.quote = mkquote(clock())
         assert d.step()["decision_loop"]
-        overrides["funding_carry"] = (0, None)  # the target flips intra-bar ...
-        clock.set(clock() + pd.Timedelta(minutes=20))
+        overrides["funding_carry"] = (0, None)  # whatever the model would say now ...
+        clock.set(at_bar(T0, 20 * 60))
         feed.quote = mkquote(clock())
         st = d.step()
-        assert not st["decision_loop"] and st["fills"] == []  # ... but nothing trades until the bar closes
-        clock.set(PANEL_END + pd.Timedelta(hours=1, seconds=30))
+        assert not st["decision_loop"] and st["fills"] == [] and calls == [T0]  # ... nothing until a bar closes
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1)))
         feed.quote = mkquote(clock())
         st = d.step()
         assert st["decision_loop"] and [f["reason"] for f in st["fills"]] == ["EXIT", "EXIT"]
+        assert calls == [T0, T0 + pd.Timedelta(hours=1)]
     assert len(events(tmp_path, "DECISION")) == 2
 
 
-def test_safe_on_stale_quote_blocks_entries(tmp_path, monkeypatch):
-    fake_targets(monkeypatch, {"funding_carry": (1, None)})
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with make_daemon(tmp_path, clock, feed, make_panel(n_hours=24 * 45)) as d:
+def test_stale_quote_is_safe_entries_blocked_exits_allowed(tmp_path, monkeypatch):
+    overrides = {"funding_carry": (1, None)}
+    fake_targets(monkeypatch, overrides)
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed) as d:
         feed.quote = mkquote(clock(), age_s=6 * 60)  # 6 min old
         st = d.step()
         assert st["safe_codes"] == ["STALE_QUOTE"] and st["fills"] == [] and not st["halted"]
-        safe = events(tmp_path, "SAFE")
-        assert len(safe) == 1 and safe[0]["active"] and safe[0]["codes"] == ["STALE_QUOTE"]
-        assert events(tmp_path, "DECISION") == [] and events(tmp_path, "HEARTBEAT")[-1]["status"] == "SAFE"
-        clock.set(clock() + pd.Timedelta(minutes=1))
-        feed.quote = mkquote(clock())  # fresh again: SAFE clears and the pending decision is taken
+        assert st["actions"]["funding_carry"] == "BLOCKED_SAFE"
+        (safe,) = events(tmp_path, "SAFE")
+        assert safe["active"] and safe["codes"] == ["STALE_QUOTE"]
+        assert events(tmp_path, "DECISION")[-1]["entries_allowed"] is False
+        clock.set(at_bar(T0, 120))
+        feed.quote = mkquote(clock())  # fresh again, same bar: the blocked entry waits for the next bar
         st = d.step()
-        assert st["safe_codes"] == [] and len(st["fills"]) == 2
-        assert events(tmp_path, "SAFE")[-1]["active"] is False
+        assert st["safe_codes"] == [] and st["fills"] == [] and st["actions"]["funding_carry"] == "WAIT_BAR"
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1)))
+        feed.quote = mkquote(clock())
+        assert len(d.step()["fills"]) == 2  # next closed bar: entered
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1), 50 * 60))
+        feed.quote = mkquote(clock())  # a fresh poll late in that hour
+        assert d.step()["fills"] == []
+        overrides["funding_carry"] = (0, None)
+        clock.set(at_bar(T0 + pd.Timedelta(hours=2)))
+        feed.quote = mkquote(clock(), age_s=7 * 60)  # stale again at the next decision: the exit still goes through
+        st = d.step()
+        assert st["safe_codes"] == ["STALE_QUOTE"] and [f["reason"] for f in st["fills"]] == ["EXIT", "EXIT"]
+        assert all(f["stale_quote"] for f in st["fills"])  # paper exit on a 7-min-old quote, flagged as such
 
 
-def test_halt_and_flatten_after_30_minutes_without_a_fresh_quote(tmp_path, monkeypatch):
+def test_halt_after_30_minutes_without_a_fresh_quote_keeps_positions(tmp_path, monkeypatch):
     fake_targets(monkeypatch, {"funding_carry": (1, None)})
-    t0 = PANEL_END + pd.Timedelta(seconds=30)
+    t0 = at_bar(T0)
     clock, feed = Clock(t0), FakeFeed()
-    panel = make_panel(n_hours=24 * 45)
-    d = make_daemon(tmp_path, clock, feed, panel)
+    d = make_daemon(tmp_path, clock, feed)
     feed.quote = mkquote(t0)
     assert len(d.step()["fills"]) == 2
     feed.quote = FeedError("HTTP 503 from bookTicker")
     clock.set(t0 + pd.Timedelta(minutes=11))
     st = d.step()
     assert st["safe_codes"] == ["FEED_ERROR"] and not st["halted"]
-    assert len(d.book.strategies["funding_carry"].positions) == 2  # SAFE keeps positions
     clock.set(t0 + pd.Timedelta(minutes=31))
+    n_fills = len(events(tmp_path, "FILL"))
     st = d.step()
     assert st["halted"] and d.halted
-    kill = events(tmp_path, "KILL")
-    assert len(kill) == 1 and kill[0]["switch"] == "STALE_QUOTE_30MIN"
-    flat = [f for f in events(tmp_path, "FILL") if f["reason"] == "KILL"]
-    assert [(f["leg"], f["side"]) for f in flat] == [("spot", "sell"), ("perp", "buy")]
-    assert all(f["stale_quote"] for f in flat)  # paper flatten on the last (stale) quote, flagged as such
-    assert events(tmp_path, "HALT")[-1]["switch"] == "STALE_QUOTE_30MIN"
-    assert d.book.strategies["funding_carry"].positions == [] and d.book.halted["switch"] == "STALE_QUOTE_30MIN"
+    (halt,) = events(tmp_path, "HALT")
+    assert halt["switch"] == "STALE_QUOTE_30MIN" and halt["flattened"] is False and len(halt["positions_kept"]) == 2
+    assert len(events(tmp_path, "FILL")) == n_fills and events(tmp_path, "KILL") == []  # nothing traded blind
+    assert len(d.book.strategies["funding_carry"].positions) == 2 and d.book.halted["switch"] == "STALE_QUOTE_30MIN"
+    clock.set(t0 + pd.Timedelta(minutes=40))
+    feed.quote = mkquote(clock())
+    assert d.step()["halted"] and len(events(tmp_path, "FILL")) == n_fills  # inert after HALT
     d.close()
     with pytest.raises(StartupRefused):  # a halted book needs a deliberate restart
-        make_daemon(tmp_path, clock, feed, panel)
-    make_daemon(tmp_path, clock, feed, panel, clear_halt=True).close()
+        make_daemon(tmp_path, clock, feed)
+    make_daemon(tmp_path, clock, feed, clear_halt=True).close()
     assert events(tmp_path, "HEARTBEAT")[-1]["phase"] == "clear_halt"
+    assert daemon_mod.EXIT_HALT == 4
+
+
+def test_cli_exit_code_is_4_after_a_halt(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon_mod, "run", lambda *a, **k: {"halted": True})
+    assert main(["--root", ROOT, "--mode", "paper", "--once", "--state-dir", str(tmp_path)]) == 4
+
+
+def test_drawdown_beyond_5_percent_is_safe_without_flattening(tmp_path, monkeypatch):
+    fake_targets(monkeypatch, {"funding_carry": (1, None), "random_maturity": (1, None)})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed, strategies=("funding_carry", "random_maturity")) as d:
+        feed.quote = mkquote(clock())
+        assert len(d.step()["fills"]) == 4
+        clock.set(at_bar(T0, 90))
+        feed.quote = mkquote(clock(), spot=45_000.0, perp=50_000.0)  # long spot -10%, short perp flat
+        st = d.step()
+        assert "DRAWDOWN" in st["safe_codes"] and st["mtm"]["drawdown"] > 0.05 and not st["halted"]
+        assert st["fills"] == [] and events(tmp_path, "KILL") == [] and events(tmp_path, "HALT") == []
+        assert all(len(d.book.strategies[n].positions) == 2 for n in ("funding_carry", "random_maturity"))
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1)))
+        feed.quote = mkquote(clock(), spot=50_000.0, perp=50_000.0)  # recovered: entries stay blocked
+        st = d.step()
+        assert "DRAWDOWN" in st["safe_codes"]
+
+
+def test_margin_breach_on_an_isolated_leg_flattens_that_strategy_only(tmp_path, monkeypatch):
+    fake_targets(monkeypatch, {"funding_carry": (1, None), "calendar": (1, "SYN_CQ")})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed, strategies=("funding_carry", "calendar")) as d:
+        feed.quote = mkquote(clock(), cq=("SYN_CQ", 50_000.0, CQ_EXP))
+        assert len(d.step()["fills"]) == 4
+        clock.set(at_bar(T0, 90))
+        # +55% on everything: the hedge is delta-neutral, but the isolated short perp of S2 is past
+        # 1/leverage - maintenance = 49.6%; S3 (cross collateral) is long perp / short quarterly: no breach
+        feed.quote = mkquote(clock(), spot=77_500.0, perp=77_500.0, cq=("SYN_CQ", 77_500.0, CQ_EXP))
+        st = d.step()
+        (kill,) = events(tmp_path, "KILL")
+        assert kill["switch"] == "MARGIN_BREACH" and kill["strategy"] == "funding_carry"
+        assert kill["adverse_move"] == pytest.approx(77_500.0 / (49_999.5 * 0.9998) - 1.0)
+        assert [(f["strategy"], f["leg"], f["reason"]) for f in st["fills"]] == [
+            ("funding_carry", "perp", "LIQUIDATION"), ("funding_carry", "spot", "KILL")]
+        fc, cal = d.book.strategies["funding_carry"], d.book.strategies["calendar"]
+        assert fc.positions == [] and fc.penalties == pytest.approx(st["fills"][0]["qty"] * st["fills"][0]["price"] * 50e-4)
+        assert len(cal.positions) == 2 and max(p.peak_adverse_move for p in cal.positions) > 0.5  # tracked only
+        assert "MARGIN_BREACH" in st["safe_codes"] and not st["halted"]
 
 
 def test_no_entry_while_safe_after_a_decision_path_exception(tmp_path, monkeypatch):
-    fail = [1]
-    fake_targets(monkeypatch, {"funding_carry": (1, None)}, fail=fail)
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with make_daemon(tmp_path, clock, feed, make_panel(n_hours=24 * 45)) as d:
+    fake_targets(monkeypatch, {"funding_carry": (1, None)}, fail=[1])
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed) as d:
         feed.quote = mkquote(clock())
         st = d.step()
-        assert st["safe_codes"] == ["DECISION_EXCEPTION"] and st["fills"] == []
+        assert st["safe_codes"] == ["DECISION_EXCEPTION"] and st["fills"] == [] and not st["decision_loop"]
         assert events(tmp_path, "ERROR")[0]["where"] == "decision"
-        clock.set(PANEL_END + pd.Timedelta(hours=1, seconds=30))  # next bar, signal path healthy, target +1
+        clock.set(at_bar(T0, 90))  # same bar: the failed decision is retried, entries stay blocked
         feed.quote = mkquote(clock())
         st = d.step()
-        assert st["decision_loop"] and st["fills"] == [] and st["safe_codes"] == ["DECISION_EXCEPTION"]
-        assert st["actions"]["funding_carry"] == "BLOCKED_SAFE"
-        dec = events(tmp_path, "DECISION")[-1]
-        assert dec["entries_allowed"] is False and dec["strategies"]["funding_carry"]["target"] == 1
+        assert st["decision_loop"] and st["fills"] == [] and st["actions"]["funding_carry"] == "BLOCKED_SAFE"
+        assert st["safe_codes"] == ["DECISION_EXCEPTION"]
+        assert events(tmp_path, "DECISION")[-1]["entries_allowed"] is False
 
 
 def test_exits_are_still_allowed_in_safe(tmp_path, monkeypatch):
     overrides, fail = {"funding_carry": (1, None)}, [0]
     fake_targets(monkeypatch, overrides, fail=fail)
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with make_daemon(tmp_path, clock, feed, make_panel(n_hours=24 * 45)) as d:
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed) as d:
         feed.quote = mkquote(clock())
         assert len(d.step()["fills"]) == 2
-        fail[0] = 1  # next loop: decision-path exception -> sticky SAFE
-        clock.set(clock() + pd.Timedelta(minutes=1))
+        fail[0] = 1  # the next decision raises -> sticky SAFE
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1)))
         feed.quote = mkquote(clock())
         assert d.step()["safe_codes"] == ["DECISION_EXCEPTION"]
         overrides["funding_carry"] = (0, None)
-        clock.set(PANEL_END + pd.Timedelta(hours=1, seconds=30))
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1), 90))  # the retried decision says exit
         feed.quote = mkquote(clock())
         st = d.step()
         assert [(f["leg"], f["reason"]) for f in st["fills"]] == [("spot", "EXIT"), ("perp", "EXIT")]
         assert d.book.strategies["funding_carry"].positions == [] and st["safe_codes"] == ["DECISION_EXCEPTION"]
 
 
-def test_drawdown_beyond_5_percent_flattens_and_halts(tmp_path, monkeypatch):
-    fake_targets(monkeypatch, {"funding_carry": (1, None)})
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    d = make_daemon(tmp_path, clock, feed, make_panel(n_hours=24 * 45))
-    feed.quote = mkquote(clock())
-    assert len(d.step()["fills"]) == 2
-    clock.set(clock() + pd.Timedelta(minutes=1))
-    feed.quote = mkquote(clock(), spot=46_000.0, perp=50_000.0)  # long spot -8%, short perp flat: -800 USDT
-    st = d.step()
-    assert st["halted"] and events(tmp_path, "KILL")[-1]["switch"] == "DRAWDOWN"
-    assert st["mtm"]["drawdown"] > 0.05
-    assert [(f["leg"], f["side"], f["reason"]) for f in st["fills"]] == [("spot", "sell", "KILL"), ("perp", "buy", "KILL")]
-    assert not any(f["stale_quote"] for f in st["fills"])
-    assert events(tmp_path, "HALT")[-1]["switch"] == "DRAWDOWN" and d.book.halted is not None
-    d.close()
-
-
 def test_funding_accrues_once_to_legs_held_before_the_stamp(tmp_path, monkeypatch):
-    """Stamp 00:00. Strategy A (funding_carry) is short perp from 23:00 and exits at 00:00:30; strategy B
-    (random_maturity) enters at 00:00:30. The settled print is published late (seen at 00:01:30): A still
+    """Stamp 00:00. Strategy A (funding_carry) is short perp from 23:00 and exits on the 00:00 bar; strategy B
+    (random_maturity) enters on that bar. The settled print is published late (seen at 00:01:30): A still
     receives it (held at the stamp), B does not (opened after), and nothing is accrued twice."""
     overrides = {"funding_carry": (1, None), "random_maturity": (0, None)}
     fake_targets(monkeypatch, overrides)
-    stamp = PANEL_END + pd.Timedelta(hours=1)  # 2025-02-15 00:00
-    clock, feed, funding = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed(), FakeFunding()
-    with make_daemon(tmp_path, clock, feed, make_panel(n_hours=24 * 45),
-                     strategies=("funding_carry", "random_maturity"), funding=funding) as d:
+    stamp = T0 + pd.Timedelta(hours=1)  # 2025-02-15 00:00
+    clock, feed, funding = Clock(at_bar(T0)), FakeFeed(), FakeFunding()
+    with make_daemon(tmp_path, clock, feed, strategies=("funding_carry", "random_maturity"), funding=funding) as d:
         feed.quote = mkquote(clock(), next_funding=stamp)
         assert len(d.step()["fills"]) == 2
         assert d.book.next_funding_ms == to_ms(stamp)
 
         overrides.update({"funding_carry": (0, None), "random_maturity": (1, None)})
-        clock.set(stamp + pd.Timedelta(seconds=30))  # stamp crossed; print not yet published
+        clock.set(at_bar(stamp))  # stamp crossed; the closed panel already carries the print (history)
         feed.quote = mkquote(clock(), next_funding=stamp + pd.Timedelta(hours=8))
         st = d.step()
-        assert st["funding"] == [] and d.book.funding_due_ms == to_ms(stamp)
+        assert st["funding"] == [] and d.book.funding_due_ms == to_ms(stamp) and st["decision_bar"] == stamp
         assert sorted((f["strategy"], f["reason"]) for f in st["fills"]) == [
             ("funding_carry", "EXIT"), ("funding_carry", "EXIT"), ("random_maturity", "ENTER"),
             ("random_maturity", "ENTER")]
 
         funding.prints = [(stamp, 0.0001, 50_010.0)]
-        clock.set(stamp + pd.Timedelta(seconds=90))
+        clock.set(at_bar(stamp, 90))
         feed.quote = mkquote(clock(), next_funding=stamp + pd.Timedelta(hours=8))
         st = d.step()
-        assert len(st["funding"]) == 1
-        acc = events(tmp_path, "FUNDING_ACCRUAL")
-        assert len(acc) == 1 and acc[0]["strategy"] == "funding_carry" and acc[0]["closed_leg"] is True
-        assert acc[0]["amount"] == pytest.approx(0.2 * 0.0001 * 50_010.0)  # short receives positive funding
+        (acc,) = events(tmp_path, "FUNDING_ACCRUAL")
+        assert acc["strategy"] == "funding_carry" and acc["closed_leg"] is True and len(st["funding"]) == 1
+        assert acc["amount"] == pytest.approx(0.2 * 0.0001 * 50_010.0)  # short receives positive funding
         assert d.book.strategies["funding_carry"].funding == pytest.approx(0.2 * 0.0001 * 50_010.0)
         assert d.book.strategies["random_maturity"].funding == 0.0
         assert d.book.funding_due_ms is None and d.book.closed_perp == []
-        assert d.panel.loc[stamp, "funding_rate"] == pytest.approx(0.0001)  # settled print patched into the panel
 
-        clock.set(stamp + pd.Timedelta(minutes=5))
+        clock.set(at_bar(stamp, 300))
         feed.quote = mkquote(clock(), next_funding=stamp + pd.Timedelta(hours=8))
         assert d.step()["funding"] == [] and len(events(tmp_path, "FUNDING_ACCRUAL")) == 1
 
 
+def test_decision_waits_for_a_missing_settled_print(tmp_path, monkeypatch):
+    calls = fake_targets(monkeypatch, {})
+    stamp = T0 + pd.Timedelta(hours=1)
+    panel = PANEL.copy()
+    panel.loc[stamp, "funding_rate"] = np.nan  # history fetched before the print was published
+    clock, feed, funding = Clock(at_bar(T0)), FakeFeed(), FakeFunding()
+    with make_daemon(tmp_path, clock, feed, panel=panel, funding=funding) as d:
+        feed.quote = mkquote(clock(), next_funding=stamp)
+        d.step()
+        clock.set(at_bar(stamp))
+        feed.quote = mkquote(clock(), next_funding=stamp + pd.Timedelta(hours=8))
+        st = d.step()
+        assert not st["decision_loop"] and "waiting" in st["waiting"] and calls == [T0]
+        funding.prints = [(stamp, 0.0003, 50_000.0)]
+        clock.set(at_bar(stamp, 60))
+        st = d.step()
+        assert st["decision_bar"] == stamp and d.closed.loc[stamp, "funding_rate"] == pytest.approx(0.0003)
+
+
 def test_held_quarterly_settles_at_expiry_and_the_remaining_leg_is_closed(tmp_path, monkeypatch):
     fake_targets(monkeypatch, {"cash_and_carry": (1, "SYN_CQ")})  # hold the CQ into its expiry
-    panel = make_panel(n_hours=24 * 60 + 8, n_contracts=3)  # ends 2025-03-02 07:00
-    clock, feed = Clock(panel.index[-1] + pd.Timedelta(seconds=30)), FakeFeed()
-    with make_daemon(tmp_path, clock, feed, panel, strategies=("cash_and_carry",)) as d:
+    panel = make_panel(n_hours=24 * 60 + 12, n_contracts=3)
+    last = CQ_EXP - pd.Timedelta(hours=1)  # 2025-03-02 07:00
+    clock, feed = Clock(at_bar(last)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed, panel=panel, strategies=("cash_and_carry",)) as d:
         feed.quote = mkquote(clock())
         st = d.step()
         assert [(f["instrument"], f["side"]) for f in st["fills"]] == [(ROOT, "buy"), ("SYN_CQ", "sell")]
         entry = st["fills"][1]["price"]
-        clock.set(CQ_EXP + pd.Timedelta(seconds=30))
+        clock.set(at_bar(CQ_EXP))
         feed.quote = mkquote(clock(), cq=("SYN_NQ", 51_500.0, NQ_EXP), nq=("SYN_Q3", 52_700.0, Q3_EXP),
                              index=50_050.0)
         st = d.step()
@@ -684,6 +814,118 @@ def test_held_quarterly_settles_at_expiry_and_the_remaining_leg_is_closed(tmp_pa
         assert exp["realized"] == pytest.approx(-0.2 * (50_050.0 - entry))
         assert [(f["instrument"], f["side"], f["reason"]) for f in st["fills"]] == [(ROOT, "sell", "EXIT")]
         assert d.book.strategies["cash_and_carry"].positions == [] and d.book.strategies["cash_and_carry"].n_expiries == 1
+
+
+class NoQuarterlyBroker(PaperBroker):
+    """Paper fills, but quarterlies are 'not listed' (the testnet situation for delivery contracts)."""
+
+    name = "testnet-stub"
+
+    def supports(self, leg, instrument):
+        return leg != "fut"
+
+
+class SecondLegFailsBroker(PaperBroker):
+    def __init__(self):
+        super().__init__()
+        self.n = 0
+
+    def place(self, order, quote):
+        self.n += 1
+        if self.n == 2:
+            raise BrokerError("synthetic rejection of the second leg")
+        return super().place(order, quote)
+
+
+class ListingVanishesBroker(PaperBroker):
+    """supports() says yes, place() then finds the quarterly unlisted (listing changed between the calls)."""
+
+    def place(self, order, quote):
+        if order.leg == "fut":
+            raise UnsupportedOnTestnet(f"{order.instrument} is not listed on the futures testnet")
+        return super().place(order, quote)
+
+
+def test_testnet_mode_skips_unsupported_quarterly_strategies(tmp_path, monkeypatch):
+    fake_targets(monkeypatch, {"cash_and_carry": (1, "SYN_CQ"), "funding_carry": (1, None)})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed, strategies=("cash_and_carry", "funding_carry"), mode="testnet",
+                     broker=NoQuarterlyBroker()) as d:
+        feed.quote = mkquote(clock())
+        st = d.step()
+        assert st["actions"] == {"cash_and_carry": "UNSUPPORTED", "funding_carry": "ENTER"}
+        assert d.sticky == {} and d.book.strategies["cash_and_carry"].positions == []
+        (dec,) = events(tmp_path, "DECISION", mode="testnet")
+        assert dec["strategies"]["cash_and_carry"]["action"] == "UNSUPPORTED"
+        assert dec["notes"]["cash_and_carry"]["unsupported"] == ["SYN_CQ"]
+
+
+def test_unsupported_raised_by_the_broker_is_skipped_not_propagated(tmp_path, monkeypatch):
+    fake_targets(monkeypatch, {"cash_and_carry": (1, "SYN_CQ")})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed, strategies=("cash_and_carry",), mode="testnet",
+                     broker=ListingVanishesBroker()) as d:
+        feed.quote = mkquote(clock())
+        st = d.step()
+        assert st["actions"]["cash_and_carry"] == "UNSUPPORTED" and d.sticky == {}
+        assert [(f["leg"], f["reason"]) for f in st["fills"]] == [("spot", "ENTER"), ("spot", "EXIT")]  # unwound
+        assert d.book.strategies["cash_and_carry"].positions == [] and st["errors"] == []
+
+
+def test_paper_and_testnet_books_and_ledgers_are_separate(tmp_path, monkeypatch):
+    fake_targets(monkeypatch, {"funding_carry": (1, None)})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    feed.quote = mkquote(clock())
+    with make_daemon(tmp_path, clock, feed) as paper, \
+            make_daemon(tmp_path, clock, feed, mode="testnet", broker=NoQuarterlyBroker()) as testnet:
+        paper.step()
+        testnet.step()
+        assert paper.paths.dir == tmp_path / ROOT / "paper" and testnet.paths.dir == tmp_path / ROOT / "testnet"
+    paper_fills, testnet_fills = events(tmp_path, "FILL"), events(tmp_path, "FILL", mode="testnet")
+    assert {f["broker"] for f in paper_fills} == {"paper"} and {f["broker"] for f in testnet_fills} == {"testnet-stub"}
+    assert Book.load(state_paths(tmp_path, ROOT, "testnet").book).mode == "testnet"
+
+
+def test_unexpected_feed_exception_is_a_non_sticky_safe(tmp_path, monkeypatch):
+    fake_targets(monkeypatch, {"funding_carry": (1, None)})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed) as d:
+        feed.quote = ValueError("malformed payload")
+        st = d.step()
+        assert st["safe_codes"] == ["FEED_ERROR"] and d.sticky == {} and st["fills"] == []
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1)))
+        feed.quote = mkquote(clock())
+        assert len(d.step()["fills"]) == 2  # recovers at the next closed bar
+
+
+def test_failed_second_leg_unwinds_the_first_and_blocks_entries(tmp_path, monkeypatch):
+    fake_targets(monkeypatch, {"funding_carry": (1, None)})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed, broker=SecondLegFailsBroker()) as d:
+        feed.quote = mkquote(clock())
+        st = d.step()
+        assert st["actions"]["funding_carry"] == "UNWOUND"
+        assert [(f["leg"], f["side"], f["reason"]) for f in st["fills"]] == [("spot", "buy", "ENTER"),
+                                                                            ("spot", "sell", "KILL")]
+        assert d.book.strategies["funding_carry"].positions == [] and st["safe_codes"] == ["BROKER_FAILURE"]
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1)))
+        feed.quote = mkquote(clock())
+        st = d.step()  # next bar: target still +1, but entries stay blocked until restart
+        assert st["fills"] == [] and st["actions"]["funding_carry"] == "BLOCKED_SAFE"
+
+
+def test_history_lag_pauses_decisions(tmp_path, monkeypatch):
+    calls = fake_targets(monkeypatch, {})
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with Daemon(ROOT, "paper", strategies=("funding_carry",), state_dir=tmp_path, feed=feed, broker=PaperBroker(),
+                history_fn=lambda r: PANEL[PANEL.index <= T0], funding_fn=FakeFunding(), clock=clock) as d:
+        feed.quote = mkquote(clock())
+        d.step()
+        clock.set(at_bar(T0 + pd.Timedelta(hours=1), 120))  # the next bar never arrives from history
+        feed.quote = mkquote(clock())
+        st = d.step()
+        assert st["safe_codes"] == ["HISTORY_LAG"] and not st["decision_loop"] and calls == [T0]
+        assert "live row" not in str(st["safe"])  # no provisional row across a hole
 
 
 def test_testnet_mode_refuses_to_start_without_keys(tmp_path, monkeypatch, capsys):
@@ -699,89 +941,9 @@ def test_testnet_mode_refuses_to_start_without_keys(tmp_path, monkeypatch, capsy
 
 
 def test_a_second_daemon_on_the_same_book_is_refused(tmp_path):
-    clock, feed = Clock(PANEL_END), FakeFeed()
-    panel = make_panel(n_hours=24 * 3)
-    with make_daemon(tmp_path, clock, feed, panel), pytest.raises(StateLocked):
-        make_daemon(tmp_path, clock, feed, panel)
-
-
-class NoQuarterlyBroker(PaperBroker):
-    """Paper fills, but quarterlies are 'not listed' (the testnet situation for a PENDING_TRADING contract)."""
-
-    def supports(self, leg, instrument):
-        return leg != "fut"
-
-
-class SecondLegFailsBroker(PaperBroker):
-    def __init__(self):
-        super().__init__()
-        self.n = 0
-
-    def place(self, order, quote):
-        self.n += 1
-        if self.n == 2:
-            from basis_arb.live.broker import BrokerError
-
-            raise BrokerError("synthetic rejection of the second leg")
-        return super().place(order, quote)
-
-
-def test_unexpected_feed_exception_is_a_non_sticky_safe(tmp_path, monkeypatch):
-    fake_targets(monkeypatch, {"funding_carry": (1, None)})
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with make_daemon(tmp_path, clock, feed, make_panel(n_hours=24 * 45)) as d:
-        feed.quote = ValueError("malformed payload")
-        st = d.step()
-        assert st["safe_codes"] == ["FEED_ERROR"] and d.sticky_safe is None and st["fills"] == []
-        feed.quote = mkquote(clock())
-        assert len(d.step()["fills"]) == 2  # recovers on the next good snapshot
-
-
-def test_quarterly_not_tradable_on_the_venue_is_skipped_not_half_entered(tmp_path, monkeypatch):
-    fake_targets(monkeypatch, {"cash_and_carry": (1, "SYN_CQ")})
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with Daemon(ROOT, "paper", strategies=("cash_and_carry",), state_dir=tmp_path, feed=feed,
-                broker=NoQuarterlyBroker(), history_fn=lambda r: make_panel(n_hours=24 * 45),
-                funding_fn=FakeFunding(), clock=clock) as d:
-        feed.quote = mkquote(clock())
-        st = d.step()
-        assert st["actions"]["cash_and_carry"] == "UNSUPPORTED" and st["fills"] == []
-        assert d.sticky_safe is None and d.book.strategies["cash_and_carry"].positions == []
-
-
-def test_failed_second_leg_unwinds_the_first_and_blocks_entries(tmp_path, monkeypatch):
-    fake_targets(monkeypatch, {"funding_carry": (1, None)})
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with Daemon(ROOT, "paper", strategies=("funding_carry",), state_dir=tmp_path, feed=feed,
-                broker=SecondLegFailsBroker(), history_fn=lambda r: make_panel(n_hours=24 * 45),
-                funding_fn=FakeFunding(), clock=clock) as d:
-        feed.quote = mkquote(clock())
-        st = d.step()
-        assert st["actions"]["funding_carry"] == "UNWOUND"
-        assert [(f["leg"], f["side"], f["reason"]) for f in st["fills"]] == [("spot", "buy", "ENTER"),
-                                                                            ("spot", "sell", "KILL")]
-        assert d.book.strategies["funding_carry"].positions == [] and st["safe_codes"] == ["BROKER_FAILURE"]
-        clock.set(PANEL_END + pd.Timedelta(hours=1, seconds=30))
-        feed.quote = mkquote(clock())
-        st = d.step()  # next bar: target still +1, but entries stay blocked until restart
-        assert st["fills"] == [] and st["actions"]["funding_carry"] == "BLOCKED_SAFE"
-
-
-def test_step_is_inert_after_a_halt(tmp_path, monkeypatch):
-    fake_targets(monkeypatch, {"funding_carry": (1, None)})
-    clock, feed = Clock(PANEL_END + pd.Timedelta(seconds=30)), FakeFeed()
-    with make_daemon(tmp_path, clock, feed, make_panel(n_hours=24 * 45)) as d:
-        feed.quote = mkquote(clock())
-        d.step()
-        clock.set(clock() + pd.Timedelta(minutes=1))
-        feed.quote = mkquote(clock(), spot=46_000.0, perp=50_000.0)
-        assert d.step()["halted"]
-        n_events = len(events(tmp_path))
-        clock.set(PANEL_END + pd.Timedelta(hours=1, seconds=30))
-        feed.quote = mkquote(clock())
-        st = d.step()
-        assert st["halted"] and st["fills"] == [] and len(events(tmp_path)) == n_events
-    assert daemon_mod.EXIT_HALT == 4  # distinct from a crash (1) for supervisors
+    clock, feed = Clock(at_bar(T0)), FakeFeed()
+    with make_daemon(tmp_path, clock, feed), pytest.raises(StateLocked):
+        make_daemon(tmp_path, clock, feed)
 
 
 # =============================================================================================
@@ -790,10 +952,11 @@ def test_step_is_inert_after_a_halt(tmp_path, monkeypatch):
 @pytest.mark.network
 def test_paper_once_against_live_endpoints(tmp_path, capsys):
     st = run(root="BTCUSDT", mode="paper", once=True, state_dir=tmp_path)
-    paths = state_paths(tmp_path, "BTCUSDT")
+    paths = state_paths(tmp_path, "BTCUSDT", "paper")
     assert paths.book.exists() and paths.events.exists()
     assert not st["halted"] and st["quote"] is not None and st["quote_fresh"]
+    assert st["decision_loop"] and st["decision_bar"] < st["live_row_ts"]  # decided on a closed bar
     assert set(st["signals"]) == {"funding_carry", "cash_and_carry", "calendar", "random_maturity"}
     kinds = [e["kind"] for e in Ledger(paths.events).read()]
-    assert "SNAPSHOT" in kinds and "HEARTBEAT" in kinds
+    assert "SNAPSHOT" in kinds and "HEARTBEAT" in kinds and "DECISION" in kinds
     assert "basis_arb live | BTCUSDT | paper" in capsys.readouterr().out

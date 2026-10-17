@@ -7,10 +7,13 @@ quarterlies, FRED DTB3 and the panel assembly (contract selection rule of strate
 section 2). Once data/panel.py exists, recent_panel() should delegate to it, and a test should
 assert that both produce the same rows on an overlapping window.
 
-Panel conventions (strategy_spec.md section 2): index `ts` = bar END (bar covers [ts-1h, ts)); only
-complete bars (ts <= floor(now)); funding at the hour-floored stamp row, NaN elsewhere; at `ts`,
-cq = the listed quarterly with the nearest expiry > ts, nq = the one after it; r_usd = FRED DTB3/100
-with observation date d applied from d 00:00 UTC onward; y_coin = RateInputs.coin_yield[base].
+Panel conventions (strategy_spec.md section 2, v1.0.2): index `ts` = bar END (bar covers [ts-1h, ts)) on
+a complete 1h grid; only closed bars (ts <= floor(now)); a missing spot/perp bar is forward-filled (close
+only, at most MAX_FFILL_HOURS consecutive hours, high/low stay NaN so the model marks it `stale_bar`); a
+longer outage trims the window to the bars after it (the data layer raises instead; the daemon must keep
+running); funding at the hour-floored stamp row, NaN elsewhere; at `ts`, cq = the listed quarterly with the
+nearest expiry > ts, nq = the one after it; r_usd = FRED DTB3/100 with the observation for date d applied
+from d + 1 00:00 UTC (publication lag); y_coin = RateInputs.coin_yield[base] (0 for BTC and ETH in v1).
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ UM_BASE = "https://fapi.binance.com"
 FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 HOUR_MS = 3_600_000
 DEFAULT_HOURS = 24 * 45  # 90 funding prints at 8h = 30 days, plus margin for the state machines
+MAX_FFILL_HOURS = 5  # same limit as data/panel.py (strategy_spec.md section 2)
 QUARTERLY_TYPES = ("CURRENT_QUARTER", "NEXT_QUARTER")
 KLINE_COLUMNS = ("close", "high", "low")
 
@@ -182,9 +186,11 @@ def fred_dtb3(client: PublicClient, start: pd.Timestamp) -> pd.Series:
 
 
 def r_usd_series(index: pd.DatetimeIndex, client: PublicClient, rates: RateInputs) -> tuple[pd.Series, str]:
-    """Forward-filled DTB3/100 on `index` (no look-ahead); the configured fallback if FRED cannot be read."""
+    """Forward-filled DTB3/100 on `index`; the observation for date d applies from d + 1 00:00 UTC
+    (publication lag, strategy_spec.md section 2). The configured fallback if FRED cannot be read."""
     try:
         obs = fred_dtb3(client, index[0] - pd.Timedelta(days=30))
+        obs.index = obs.index + pd.Timedelta(days=1)  # published the next business day
         r = obs.reindex(index, method="ffill")
         if r.isna().any():
             log.warning("FRED DTB3 has no observation before %s; fallback r_usd=%.4f on %d rows",
@@ -199,15 +205,35 @@ def r_usd_series(index: pd.DatetimeIndex, client: PublicClient, rates: RateInput
 def assemble_panel(spot: pd.DataFrame, perp: pd.DataFrame, funding: pd.DataFrame | pd.Series | None,
                    contracts: list[tuple[Quarterly, pd.DataFrame]], r_usd: pd.Series,
                    y_coin: float) -> pd.DataFrame:
-    """Pure assembly of the panel contract (types.PANEL_REQUIRED_COLUMNS) from fetched parts."""
-    idx = spot.index.intersection(perp.index).sort_values()
-    if len(idx) == 0:
+    """Pure assembly of the panel contract (types.PANEL_REQUIRED_COLUMNS) from fetched parts.
+
+    The index is the complete 1h grid from the first to the last bar both spot and perp have. Missing
+    spot/perp bars: close forward-filled over at most MAX_FFILL_HOURS, high/low left NaN (stale_bar in
+    the model); if a longer outage remains, the panel starts after it (warning logged).
+    """
+    if len(spot) == 0 or len(perp) == 0:
+        raise ValueError("no spot or no perpetual bars")
+    first, last = max(spot.index.min(), perp.index.min()), min(spot.index.max(), perp.index.max())
+    if first > last:
         raise ValueError("no overlapping spot/perp bars")
-    idx = pd.DatetimeIndex(idx, name="ts")
-    df = pd.DataFrame(index=idx)
+    grid = pd.date_range(first, last, freq="1h", name="ts")
+    df = pd.DataFrame(index=grid)
     for name, src in (("spot", spot), ("perp", perp)):
-        for col in KLINE_COLUMNS:
-            df[f"{name}_{col}"] = src[col].reindex(idx).astype(float)
+        df[f"{name}_close"] = src["close"].reindex(grid).astype(float).ffill(limit=MAX_FFILL_HOURS)
+        df[f"{name}_high"] = src["high"].reindex(grid).astype(float)
+        df[f"{name}_low"] = src["low"].reindex(grid).astype(float)
+        n_filled = int(src["close"].reindex(grid).isna().sum())
+        if n_filled:
+            log.warning("%s: %d missing 1h bar(s) on the grid (close forward-filled up to %dh, high/low NaN)",
+                        name, n_filled, MAX_FFILL_HOURS)
+    bad = (df["spot_close"].isna() | df["perp_close"].isna()).to_numpy()
+    if bad.any():
+        cut = df.index[bad][-1]
+        log.warning("outage longer than %dh ending %s: the panel starts after it", MAX_FFILL_HOURS, cut)
+        df = df[df.index > cut]
+        if df.empty:
+            raise ValueError("no usable bars after the last outage")
+    idx = df.index
     fr = pd.Series(np.nan, index=idx, dtype=float)
     if funding is not None and len(funding):
         rate = funding["rate"] if isinstance(funding, pd.DataFrame) else funding
@@ -240,7 +266,7 @@ def assemble_panel(spot: pd.DataFrame, perp: pd.DataFrame, funding: pd.DataFrame
         df[f"fut_{k}_expiry"] = pd.Series(pd.to_datetime(c["expiry"], utc=True), index=idx).astype(
             "datetime64[ns, UTC]")
         df[f"fut_{k}_dte_days"] = c["dte"]
-    df["r_usd"] = r_usd.reindex(idx).astype(float).to_numpy()
+    df["r_usd"] = r_usd.reindex(idx, method="ffill").astype(float).to_numpy()
     df["y_coin"] = float(y_coin)
     validate_panel(df)
     return df
@@ -279,10 +305,10 @@ def recent_panel(root: str, hours: int = DEFAULT_HOURS, client: PublicClient | N
             continue
         contracts.append((q, kl))
 
-    idx = spot.index.intersection(perp.index).sort_values()
-    if len(idx) == 0:
-        raise ValueError(f"no overlapping spot/perp bars for {root} in ({start}, {end}]")
-    r_usd, source = r_usd_series(pd.DatetimeIndex(idx, name="ts"), client, rates)
+    if len(spot) == 0 or len(perp) == 0:
+        raise ValueError(f"no spot or perpetual bars for {root} in ({start}, {end}]")
+    grid = pd.date_range(start + pd.Timedelta(hours=1), end, freq="1h", name="ts")
+    r_usd, source = r_usd_series(grid, client, rates)
     panel = assemble_panel(spot, perp, funding, contracts, r_usd, rates.coin_yield[base])
     expected = int(hours)
     if len(panel) < expected - 2:

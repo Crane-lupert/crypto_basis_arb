@@ -240,7 +240,8 @@ def _missing(dtype: Any) -> Any:
 
 
 def append_live_row(panel: pd.DataFrame, quote: LiveQuote) -> pd.DataFrame:
-    """Append (or replace) the in-progress hour's row built from the live quote; output passes validate_panel.
+    """Append (or replace) the provisional in-progress hour's row built from the live quote; the output passes
+    validate_panel. This row is for marking, fills and kill switches only: decisions are taken on closed bars.
 
     close = high = low = mid for spot, perp and the quoted quarterlies; funding_rate NaN unless a settled
     rate is already stored at that row (the daemon writes settled prints from /fapi/v1/fundingRate);
@@ -251,6 +252,8 @@ def append_live_row(panel: pd.DataFrame, quote: LiveQuote) -> pd.DataFrame:
     ts = live_row_ts(quote.ts)
     if ts < panel.index[-1]:
         raise ValueError(f"live row {ts} precedes the panel end {panel.index[-1]}")
+    if ts > panel.index[-1] + pd.Timedelta(hours=1):
+        raise ValueError(f"closed panel ends {panel.index[-1]}, live row {ts} would leave a hole (history lags)")
     quoted = [(s, b, a, e) for s, b, a, e in ((quote.cq_symbol, quote.cq_bid, quote.cq_ask, quote.cq_expiry),
                                               (quote.nq_symbol, quote.nq_bid, quote.nq_ask, quote.nq_expiry))
               if s is not None and e is not None and utc(e) > ts]

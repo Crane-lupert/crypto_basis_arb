@@ -1,16 +1,18 @@
 """Live book state, atomic persistence and the append-only event ledger (strategy_spec.md section 9).
 
-Files, per underlying, under the state directory (default ./state, gitignored):
-    state/{ROOT}/book.json      the Book (positions, cash, P&L components, counters); replaced atomically
-    state/{ROOT}/events.jsonl   append-only ledger, one JSON object per line, UTC ISO timestamps
-    state/{ROOT}/daemon.lock    OS-level exclusive lock: one daemon per book
+Files, per underlying AND per mode, under the state directory (default ./state, gitignored), so paper and
+testnet never share a book or a ledger:
+    state/{ROOT}/{mode}/book.json      the Book (positions, cash, P&L components, counters); replaced atomically
+    state/{ROOT}/{mode}/events.jsonl   append-only ledger, one JSON object per line, UTC ISO timestamps
+    state/{ROOT}/{mode}/daemon.lock    OS-level exclusive lock: one daemon per book
 
 Accounting (same conventions as the backtest, strategy_spec.md section 6):
     equity = cash + sum(spot_qty * spot_mark) + sum(fut_qty * (fut_mark - entry_price))
     spot fills move cash by -signed_qty * price; futures fills move cash only by fees and realized P&L.
     P&L components per strategy: funding (+ = received), fees (+ = paid, incl. delivery), slippage
-    (+ = cost of crossing the spread vs mid, incl. modeled slippage), basis = total - funding + fees +
-    slippage (the mid-to-mid convergence of the legs).
+    (+ = cost of crossing the spread vs mid, incl. modeled slippage), penalties (+ = paid, paper liquidation
+    penalty on a margin breach), basis = total - funding + fees + slippage + penalties (the mid-to-mid
+    convergence of the legs).
 """
 from __future__ import annotations
 
@@ -137,6 +139,7 @@ class StrategyBook:
     funding: float = 0.0  # cumulative funding, + = received
     fees: float = 0.0  # cumulative exchange fees, + = paid (incl. delivery fees)
     slippage: float = 0.0  # cumulative execution cost vs mid, + = cost
+    penalties: float = 0.0  # cumulative liquidation penalties (paper, margin breach), + = paid
     n_fills: int = 0
     n_entries: int = 0
     n_exits: int = 0
@@ -177,7 +180,7 @@ class StrategyBook:
         return {
             "name": self.name, "capital": self.capital, "cash": self.cash, "target": self.target,
             "contract": self.contract, "positions": [_pos_to_dict(p) for p in self.positions],
-            "funding": self.funding, "fees": self.fees, "slippage": self.slippage,
+            "funding": self.funding, "fees": self.fees, "slippage": self.slippage, "penalties": self.penalties,
             "n_fills": self.n_fills, "n_entries": self.n_entries, "n_exits": self.n_exits,
             "n_rolls": self.n_rolls, "n_expiries": self.n_expiries, "n_funding": self.n_funding,
             "signal_target": self.signal_target, "signal_contract": self.signal_contract,
@@ -190,7 +193,8 @@ class StrategyBook:
             name=d["name"], capital=float(d["capital"]), cash=float(d["cash"]), target=int(d.get("target", 0)),
             contract=d.get("contract"), positions=[_pos_from_dict(p) for p in d.get("positions", [])],
             funding=float(d.get("funding", 0.0)), fees=float(d.get("fees", 0.0)),
-            slippage=float(d.get("slippage", 0.0)), n_fills=int(d.get("n_fills", 0)),
+            slippage=float(d.get("slippage", 0.0)), penalties=float(d.get("penalties", 0.0)),
+            n_fills=int(d.get("n_fills", 0)),
             n_entries=int(d.get("n_entries", 0)), n_exits=int(d.get("n_exits", 0)),
             n_rolls=int(d.get("n_rolls", 0)), n_expiries=int(d.get("n_expiries", 0)),
             n_funding=int(d.get("n_funding", 0)), signal_target=int(d.get("signal_target", 0)),
@@ -291,6 +295,11 @@ class Book:
         s.n_funding += 1
         self.counters["funding_events"] = self.counters.get("funding_events", 0) + 1
 
+    def apply_penalty(self, strategy: str, amount: float) -> None:
+        s = self.strategies[strategy]
+        s.cash -= amount
+        s.penalties += amount
+
     def perp_exposure_at(self, stamp: Any) -> list[dict]:
         """Perp legs that were held at `stamp`: opened strictly before it and not closed before it."""
         st = utc(stamp)
@@ -343,8 +352,8 @@ class Book:
                 "equity": eq, "target": s.target, "contract": s.contract,
                 "legs": [{"leg": p.leg, "instrument": p.instrument, "qty": p.qty, "entry_price": p.entry_price}
                          for p in s.positions],
-                "pnl": {"total": pnl_total, "basis": pnl_total - s.funding + s.fees + s.slippage,
-                        "funding": s.funding, "fees": s.fees, "slippage": s.slippage},
+                "pnl": {"total": pnl_total, "basis": pnl_total - s.funding + s.fees + s.slippage + s.penalties,
+                        "funding": s.funding, "fees": s.fees, "slippage": s.slippage, "penalties": s.penalties},
             }
         eq0 = self.equity_0
         out["equity"] = total
@@ -452,8 +461,10 @@ class StatePaths(NamedTuple):
     lock: Path
 
 
-def state_paths(state_dir: str | os.PathLike, root: str) -> StatePaths:
-    d = Path(state_dir) / root
+def state_paths(state_dir: str | os.PathLike, root: str, mode: str) -> StatePaths:
+    if mode not in ("paper", "testnet"):
+        raise ValueError(f"mode must be 'paper' or 'testnet', got {mode!r}")
+    d = Path(state_dir) / root / mode
     return StatePaths(d, d / "book.json", d / "events.jsonl", d / "daemon.lock")
 
 
