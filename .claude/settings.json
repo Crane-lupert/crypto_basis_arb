@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": "Public minimal config. Runtime state and secrets are never edited by the assistant; the hook enforces it. No real-money path exists in this repository.",
+  "model": "claude-opus-5-5",
+  "modelSettings": {
+    "claude-opus-5-5": { "effortLevel": "xhigh" }
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit(./**)",
+      "Write(./**)",
+      "Bash(python:*)",
+      "Bash(pytest:*)",
+      "Bash(uv:*)",
+      "Bash(ruff:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "deny": [
+      "Edit(./state/**)",
+      "Write(./state/**)",
+      "Edit(./.env*)",
+      "Write(./.env*)",
+      "Bash(git push:*)",
+      "Bash(gh:*)",
+      "Bash(rm:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(*BINANCE_TESTNET_API_SECRET*:*)",
+      "Bash(*BINANCE_API_KEY*:*)",
+      "Bash(*BINANCE_API_SECRET*:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "python .claude/hooks/guard_runtime_paths.py", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

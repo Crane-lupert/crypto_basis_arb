@@ -1,0 +1,37 @@
+[project]
+name = "crypto-basis-arb"
+version = "0.1.0"
+description = "Theory-anchored crypto basis trading: perpetual fair funding and dated-futures cost-of-carry vs market basis, with a backtest engine and a paper-live daemon"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.2,<3",
+  "pyarrow>=15",
+  "requests>=2.31",
+  "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5"]
+
+[project.scripts]
+basis-arb = "basis_arb.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "network: tests that call public exchange APIs (deselect with -m 'not network')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

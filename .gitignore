@@ -1,0 +1,23 @@
+# environments
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# local data / runtime state (regenerate with `basis-arb fetch`)
+data/*.parquet
+data/*.csv
+data/raw/
+state/
+*.log
+
+# secrets — testnet keys only ever live in the environment, never in files
+.env
+.env.*
+
+# local Claude Code overrides (meta-harness governance copy)
+.claude/settings.local.json
