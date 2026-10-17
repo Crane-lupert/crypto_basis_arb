@@ -21,3 +21,7 @@ state/
 
 # local Claude Code overrides (meta-harness governance copy)
 .claude/settings.local.json
+
+# maintainer-only local files (never published)
+CLAUDE.local.md
+.claude/hooks/asof-drift-check.py

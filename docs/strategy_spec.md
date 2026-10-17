@@ -35,7 +35,17 @@ grid with index `ts` (tz-aware UTC). Required columns (see `basis_arb.types.PANE
 
 Contract selection: at `ts`, `cq` is the listed quarterly with the nearest `expiry > ts`; `nq` the one
 after it. A contract whose `expiry <= ts` leaves the panel at that bar. Rows where a contract did not
-trade (no kline) carry NaN in its columns; the signal treats NaN excess as "no decision".
+trade (no kline) carry NaN in its columns; the signal treats NaN excess as "no decision". Binance listed
+each next quarter only 2-10 days before the old one expired until 2023-09, so `nq` is empty for most of
+2021-2023 and a position can only roll when the next contract is already listed.
+
+Exchange outages: a missing spot or perpetual bar is forward-filled (close only, up to 5 consecutive hours;
+three Binance-wide spot gaps of 4-5h exist in 2020-21) and its `high`/`low` stay NaN. The model marks such
+rows `stale_bar` and blanks every decision column there, because a frozen spot against a moving perpetual
+manufactures premiums of up to ~2% that were never tradable.
+
+Rate timing: the T-bill observation for date `d` is published the next business day, so it applies from
+`d + 1` 00:00 UTC onward.
 
 Optional columns: `premium_index` (close of `/fapi/v1/premiumIndexKlines`), `perp_mark`.
 

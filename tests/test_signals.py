@@ -124,6 +124,19 @@ def test_cash_and_carry_hold_to_expiry_settles_at_expiry_bar():
     assert t.loc[first_exp + pd.Timedelta(hours=1), "contract"] == "SYN_NQ"
 
 
+def test_outage_rows_carry_no_decision():
+    cfg = BacktestConfig()
+    p = make_panel(perp_premium=0.0)
+    rows = p.index[100:104]
+    # exchange outage: spot close forward-filled (frozen) while the perp jumped 2% -> fake premium
+    p.loc[rows, ["spot_high", "spot_low"]] = np.nan
+    p.loc[rows, ["perp_close", "perp_high", "perp_low"]] = 50_000.0 * 1.02
+    e = sg.enrich(p, cfg)
+    assert e["stale_bar"].loc[rows].all() and e["stale_bar"].sum() == 4
+    assert e.loc[rows, "rm_dev_ann"].isna().all() and e.loc[rows, "excess_cq_ann"].isna().all()
+    assert (sg.random_maturity_targets(e, cfg)["target"] == 0).all()
+
+
 def test_nan_symbol_never_enters():
     cfg = BacktestConfig()
     p = sg.enrich(make_panel(basis_ann_cq=0.20), cfg)

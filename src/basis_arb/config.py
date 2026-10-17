@@ -64,7 +64,8 @@ class MarginModel:
     perp_leverage: float = 2.0
     fut_leverage: float = 2.0
     maintenance_margin_frac: float = 0.004  # BTC/ETH USDⓈ-M tier-1 maintenance margin ratio
-    mode: str = "isolated"
+    mode: str = "isolated"  # strategies with a spot leg (S1, S2, S4): spot gains are not futures collateral
+    futures_pair_mode: str = "cross_collateral"  # S3: both legs sit in one USDⓈ-M wallet and net against each other
 
     def liquidation_move(self, leg: str) -> float:
         lev = self.perp_leverage if leg == "perp" else self.fut_leverage
@@ -74,9 +75,15 @@ class MarginModel:
 # --- rate inputs ----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class RateInputs:
-    """r = USD/stablecoin financing rate (FRED DTB3, decimal). y = r' = coin yield (staking proxy)."""
+    """r = USD/stablecoin financing rate (FRED DTB3, decimal). y = r' = yield actually earned on the spot leg.
 
-    coin_yield: dict[str, float] = field(default_factory=lambda: {"BTC": 0.0, "ETH": 0.03})
+    v1 holds plain spot coins (no staking), so y = 0 for both BTC and ETH in the signals and the P&L.
+    The ETH staking yield is kept only as a diagnostic (what the fair basis would be if the spot leg were
+    staked); it must never enter a decision unless the engine also credits the yield.
+    """
+
+    coin_yield: dict[str, float] = field(default_factory=lambda: {"BTC": 0.0, "ETH": 0.0})
+    coin_yield_diagnostic: dict[str, float] = field(default_factory=lambda: {"BTC": 0.0, "ETH": 0.03})
     fallback_r_usd: float = 0.04  # used only if the FRED series cannot be loaded (logged loudly)
 
 
@@ -104,6 +111,7 @@ class StrategyParams:
     rm_exit_dev_ann: float = 0.0  # close when the annualized deviation first returns to zero
     # common
     min_hold_bars: int = 8  # 8 x 1h: never flip inside one funding interval; counted from entry (rolls do not reset it)
+    fill_lag_bars: int = 0  # 0 = fill at the decision bar's close (pre-registered); 1 = next bar (sensitivity axis)
     allow_reverse: bool = False  # reserved: reverse spot-leg trades need a borrow-cost model that v1 does not have,
     # so S1 / S2 / S4 ignore this flag (hard-coded off). S3 uses cal_allow_reverse.
 

@@ -24,8 +24,11 @@ Perpetual futures: He, Manela, Ross & von Wachter, "Fundamentals of Perpetual Fu
 
 Binance mechanics (support article 360033525031): F = [avg premium + clamp(I - avg premium, ±0.05%)]
     / (8/N), I = 0.01% per 8h, capped at ±0.75 x maintenance-margin ratio for majors (±0.30% BTC/ETH).
-    The 0.01% interest component is the exchange's assumed (USDT - coin) rate differential per period;
-    the theory above replaces it with the observed (r - r')/kappa.
+    Because of the clamp, the print equals exactly I = 0.01% (10.95%/yr) whenever the average premium lies
+    inside [-0.04%, +0.06%]: the interest component is a contract term, not a market rate. The equilibrium
+    funding (r - r')/kappa of the theory above is the benchmark the realized print is compared with; the
+    gap between the contract's 10.95%/yr and the benchmark is a rent that strategy S2 treats as a risk
+    premium (exchange risk, locked capital, the true cost of stablecoin funding), never as a free lunch.
 """
 from __future__ import annotations
 
@@ -191,18 +194,20 @@ def annualize_funding_prints(
 
 
 def trailing_funding_ann_window(funding_at_stamps: pd.Series, window_days: float) -> pd.Series:
-    """Calendar-window trailing mean of per-print annualized funding; NaN until a full window of history exists.
+    """Trailing realized funding over a calendar window, annualized: sum of prints in (t - W, t] x 365/W.
 
-    The window is `[t - window_days, t]`, so 30 days cover 90 prints at 8h, 180 at 4h, 720 at 1h.
+    Summing the raw prints (rather than averaging per-print annualized rates) weights every hour of the
+    window equally, so 8h, 4h and 1h funding regimes mix correctly. NaN until a full window exists.
+    30 days cover 90 prints at 8h, 180 at 4h, 720 at 1h.
     """
     if window_days <= 0:
         raise ValueError("window_days must be positive")
-    ann = annualize_funding_prints(funding_at_stamps)
-    if ann.empty:
-        return ann
+    s = funding_at_stamps.astype(float)
+    if s.empty:
+        return s
     window = pd.Timedelta(hours=float(window_days) * 24.0)
-    out = ann.rolling(window, min_periods=1).mean()
-    full = ann.index >= ann.index[0] + window
+    out = s.rolling(window, min_periods=1).sum() * (DAYS_PER_YEAR / float(window_days))
+    full = s.index >= s.index[0] + window
     return out.where(full)
 
 

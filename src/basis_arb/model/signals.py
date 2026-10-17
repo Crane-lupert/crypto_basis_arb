@@ -10,7 +10,10 @@ Every strategy produces a *target* frame aligned to the panel index:
 Decision rule (all strategies): enter when excess > hurdle (hurdle = amortized round-trip cost + buffer),
 hold while excess > exit level, exit at or below the exit level once min_hold_bars have elapsed since
 entry (a roll does not reset the clock). A NaN excess is "no decision": no entry, and an open position is
-held. Decisions at bar t use data up to and including bar t's close; the engine fills at bar t's close.
+held. A held quarterly is keyed to the expiry recorded at entry: it expires only when ts >= that expiry,
+and a data hole (missing symbol, price or dte on a later bar) is a HOLD, never an expiry or a roll.
+Decisions at bar t use data up to and including bar t's close; the engine fills at bar t's close
+(or at bar t + fill_lag_bars when that sensitivity axis is used).
 """
 from __future__ import annotations
 
@@ -23,10 +26,20 @@ from basis_arb.types import STRATEGY_LEGS, validate_panel
 
 TARGET_COLUMNS = ("target", "contract", "excess", "hurdle", "reason")
 FUNDING_FFILL_LIMIT_BARS = 9  # one 8h interval + 1h slack: a stalled funding feed turns f_hat into NaN (no decision)
+DECISION_COLUMNS = (
+    "excess_cq_ann", "excess_nq_ann", "excess_funding_ann", "rm_dev_ann", "calendar_cq_ann", "calendar_nq_ann"
+)
+_NS_PER_DAY = 86_400_000_000_000
+_NAT_NS = np.datetime64("NaT").astype("datetime64[ns]").astype(np.int64)
 
 
 def _is_sym(x) -> bool:
     return isinstance(x, str) and x != ""
+
+
+def _expiry_ns(series: pd.Series) -> np.ndarray:
+    """tz-aware expiry column -> int64 ns since epoch (NaT -> _NAT_NS)."""
+    return series.dt.tz_convert("UTC").astype("int64").to_numpy()
 
 
 # --- enrichment --------------------------------------------------------------------------------
@@ -37,16 +50,19 @@ def enrich(panel: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     r = p["r_usd"].astype(float).to_numpy()
     y = p["y_coin"].astype(float).to_numpy()
     spot = p["spot_close"].to_numpy(float)
+    perp = p["perp_close"].to_numpy(float)
 
     # dated futures: market vs cost-of-carry
     for k in ("cq", "nq"):
         tau = p[f"fut_{k}_dte_days"].astype(float).to_numpy() / DAYS_PER_YEAR
-        p[f"basis_{k}_ann"] = fv.annualized_basis(p[f"fut_{k}_close"].astype(float).to_numpy(), spot, tau)
+        fut = p[f"fut_{k}_close"].astype(float).to_numpy()
+        p[f"basis_{k}_ann"] = fv.annualized_basis(fut, spot, tau)
+        p[f"basis_vs_perp_{k}_ann"] = fv.annualized_basis(fut, perp, tau)
     p["fair_basis_ann"] = fv.fair_basis_ann(r, y)
     for k in ("cq", "nq"):
         p[f"excess_{k}_ann"] = p[f"basis_{k}_ann"] - p["fair_basis_ann"]
 
-    # perpetual: trailing funding (per-print annualized by the actual stamp interval, calendar window)
+    # perpetual: trailing funding = sum of prints over a calendar window, annualized (cadence-proof)
     stamps = p["funding_rate"].dropna()
     window_days = cfg.params.fc_lookback_prints * FUNDING_INTERVAL_HOURS / 24.0
     trailing = fv.trailing_funding_ann_window(stamps, window_days)
@@ -55,15 +71,22 @@ def enrich(panel: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     p["excess_funding_ann"] = p["funding_trailing_ann"] - p["fair_funding_ann"]
 
     # perpetual: instantaneous premium vs HMRW fair premium
-    p["perp_prem_ann"] = fv.perp_premium_ann(p["perp_close"].to_numpy(float), spot, KAPPA)
+    p["perp_prem_ann"] = fv.perp_premium_ann(perp, spot, KAPPA)
     p["fair_perp_prem_ann"] = fv.fair_perp_premium_ann(r, y, KAPPA)
     p["rm_dev_ann"] = p["perp_prem_ann"] - p["fair_perp_prem_ann"]
 
-    # calendar: quarterly basis vs expected funding
+    # calendar: quarterly-vs-perpetual spread (the spread actually traded) vs the trailing funding forecast
     for k in ("cq", "nq"):
         p[f"calendar_{k}_ann"] = fv.calendar_excess_ann(
-            p[f"basis_{k}_ann"].to_numpy(), p["funding_trailing_ann"].to_numpy()
+            p[f"basis_vs_perp_{k}_ann"].to_numpy(), p["funding_trailing_ann"].to_numpy()
         )
+
+    # exchange-outage rows (spot or perp bar missing, close forward-filled, high/low NaN): no decision.
+    # A frozen spot against a moving perp manufactures premiums of up to ~2% that are not tradable.
+    stale = p["spot_high"].isna() | p["perp_high"].isna()
+    p["stale_bar"] = stale
+    for col in DECISION_COLUMNS:
+        p.loc[stale, col] = np.nan
     return p
 
 
@@ -118,65 +141,81 @@ def _contract_loop(
     min_hold_bars: int,
     allow_reverse: bool,
 ) -> pd.DataFrame:
-    """Shared state machine for strategies whose futures leg is a specific quarterly contract."""
+    """Shared state machine for strategies whose futures leg is a specific quarterly contract.
+
+    The held contract is identified by symbol and keyed to the expiry recorded at entry. Days to expiry of
+    the held contract are computed from that expiry (not from the panel column), so a data hole can never
+    produce a phantom expiry or roll.
+    """
     n = len(p)
+    ts_ns = p.index.asi8
     sym = {"cq": p["fut_cq_symbol"].to_numpy(dtype=object), "nq": p["fut_nq_symbol"].to_numpy(dtype=object)}
     ex = {"cq": p[f"{excess_prefix}_cq_ann"].to_numpy(float), "nq": p[f"{excess_prefix}_nq_ann"].to_numpy(float)}
     dte = {"cq": p["fut_cq_dte_days"].to_numpy(float), "nq": p["fut_nq_dte_days"].to_numpy(float)}
+    exp = {"cq": _expiry_ns(p["fut_cq_expiry"]), "nq": _expiry_ns(p["fut_nq_expiry"])}
 
-    def hurdle_at(k: str, i: int) -> float:
-        d = dte[k][i]
-        if not np.isfinite(d) or d <= 0:
+    def hurdle_for(days: float) -> float:
+        if not np.isfinite(days) or days <= 0:
             return np.nan
-        return fv.amortized_cost_ann(round_trip_frac, d) + buffer_ann
+        return fv.amortized_cost_ann(round_trip_frac, days) + buffer_ann
 
     target = np.zeros(n, dtype=np.int8)
     contract = np.full(n, None, dtype=object)
     excess_out = np.full(n, np.nan)
     hurdle_out = np.full(n, np.nan)
     reason = np.full(n, "FLAT", dtype=object)
-    pos, held_sym, held_bars = 0, None, 0
+    pos, held_sym, held_exp, held_bars = 0, None, _NAT_NS, 0
 
     for i in range(n):
         if pos == 0:
             # candidate: current quarter unless it is inside the roll window (or absent), else next quarter
             k = "cq" if (_is_sym(sym["cq"][i]) and np.isfinite(dte["cq"][i]) and dte["cq"][i] >= roll_days) else "nq"
-            h, e = hurdle_at(k, i), ex[k][i]
+            h, e = hurdle_for(dte[k][i]), ex[k][i]
             excess_out[i], hurdle_out[i] = e, h
-            if _is_sym(sym[k][i]) and np.isfinite(e) and np.isfinite(h):
+            if _is_sym(sym[k][i]) and exp[k][i] != _NAT_NS and np.isfinite(e) and np.isfinite(h):
                 if e > h:
-                    pos, held_sym, held_bars, reason[i] = 1, sym[k][i], 0, "ENTER"
+                    pos, held_sym, held_exp, held_bars, reason[i] = 1, sym[k][i], exp[k][i], 0, "ENTER"
                 elif allow_reverse and e < -h:
-                    pos, held_sym, held_bars, reason[i] = -1, sym[k][i], 0, "ENTER"
+                    pos, held_sym, held_exp, held_bars, reason[i] = -1, sym[k][i], exp[k][i], 0, "ENTER"
         else:
             held_bars += 1
-            if _is_sym(sym["cq"][i]) and held_sym == sym["cq"][i]:
-                k = "cq"
-            elif _is_sym(sym["nq"][i]) and held_sym == sym["nq"][i]:
-                k = "nq"
+            if ts_ns[i] >= held_exp:
+                # the held contract has settled at its expiry: the engine books the delivery
+                pos, held_sym, held_exp, reason[i] = 0, None, _NAT_NS, "EXPIRY"
             else:
-                k = None
-            if k is None:
-                # the held contract left the panel (expired or delisted): the engine settles it
-                pos, held_sym, reason[i] = 0, None, "EXPIRY"
-            else:
-                e, d = ex[k][i], dte[k][i]
-                excess_out[i], hurdle_out[i] = e, hurdle_at(k, i)
-                in_roll_window = (not np.isfinite(d)) or d < roll_days
-                if in_roll_window and not hold_to_expiry:
-                    e_nq, h_nq = ex["nq"][i], hurdle_at("nq", i)
-                    can_roll = k == "cq" and _is_sym(sym["nq"][i]) and np.isfinite(e_nq) and np.isfinite(h_nq)
+                if _is_sym(sym["cq"][i]) and held_sym == sym["cq"][i]:
+                    k = "cq"
+                elif _is_sym(sym["nq"][i]) and held_sym == sym["nq"][i]:
+                    k = "nq"
+                else:
+                    k = None  # data hole on the held contract: no decision
+                days_left = (held_exp - ts_ns[i]) / _NS_PER_DAY
+                e = ex[k][i] if k is not None else np.nan
+                excess_out[i], hurdle_out[i] = e, hurdle_for(days_left)
+                in_roll_window = days_left < roll_days
+                if in_roll_window and hold_to_expiry:
+                    reason[i] = "HOLD"  # carried into delivery; no noise exits in the final hours
+                elif in_roll_window:
+                    e_nq, h_nq = ex["nq"][i], hurdle_for(dte["nq"][i])
+                    can_roll = (
+                        _is_sym(sym["nq"][i])
+                        and sym["nq"][i] != held_sym
+                        and exp["nq"][i] != _NAT_NS
+                        and exp["nq"][i] > held_exp
+                        and np.isfinite(e_nq)
+                        and np.isfinite(h_nq)
+                    )
                     if can_roll and ((pos == 1 and e_nq > h_nq) or (pos == -1 and e_nq < -h_nq)):
-                        held_sym, reason[i] = sym["nq"][i], "ROLL"  # min-hold clock keeps counting from entry
+                        held_sym, held_exp, reason[i] = sym["nq"][i], exp["nq"][i], "ROLL"  # min-hold clock keeps counting
                         excess_out[i], hurdle_out[i] = e_nq, h_nq
                     else:
-                        pos, held_sym, reason[i] = 0, None, "EXIT"
+                        pos, held_sym, held_exp, reason[i] = 0, None, _NAT_NS, "EXIT"
                 elif not np.isfinite(e):
                     reason[i] = "HOLD"  # no decision
                 elif held_bars >= min_hold_bars and (
                     (pos == 1 and e <= exit_level) or (pos == -1 and e >= -exit_level)
                 ):
-                    pos, held_sym, reason[i] = 0, None, "EXIT"
+                    pos, held_sym, held_exp, reason[i] = 0, None, _NAT_NS, "EXIT"
                 else:
                     reason[i] = "HOLD"
         target[i] = pos
@@ -202,7 +241,8 @@ def cash_and_carry_targets(p: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame
 
 
 def calendar_targets(p: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
-    """S3: long perp / short quarterly when quarterly basis exceeds expected funding by the hurdle (reverse allowed)."""
+    """S3: long perp / short quarterly when the quarterly-vs-perp spread exceeds the trailing funding forecast
+    by the hurdle (reverse allowed: both legs are futures)."""
     legs = tuple(leg for leg, _ in STRATEGY_LEGS["calendar"])
     return _contract_loop(
         p, "calendar", cfg.costs.round_trip_frac(legs), cfg.params.cal_entry_buffer_ann,

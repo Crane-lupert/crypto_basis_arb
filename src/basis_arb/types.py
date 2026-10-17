@@ -35,6 +35,7 @@ PANEL_OPTIONAL_COLUMNS: tuple[str, ...] = ("premium_index", "perp_mark")
 
 RATE_BOUNDS = {"r_usd": (-0.05, 0.5), "y_coin": (0.0, 0.5)}  # decimal annual rates; catches percent-unit mistakes
 DTE_TOLERANCE_DAYS = 1e-6
+HOUR_NS = 3_600_000_000_000
 
 
 def validate_panel(df: pd.DataFrame) -> None:
@@ -54,6 +55,8 @@ def validate_panel(df: pd.DataFrame) -> None:
         raise ValueError("panel index must be named 'ts'")
     if not idx.is_monotonic_increasing or idx.has_duplicates:
         raise ValueError("panel index must be strictly increasing without duplicates")
+    if len(idx) > 1 and (np.diff(idx.asi8) != HOUR_NS).any():
+        raise ValueError("panel index must be a complete 1h grid without holes")
     for col in ("spot_close", "perp_close"):
         if (df[col] <= 0).any() or df[col].isna().any():
             raise ValueError(f"panel column {col} must be positive and non-null")
@@ -63,6 +66,9 @@ def validate_panel(df: pd.DataFrame) -> None:
             raise ValueError(f"panel column fut_{k}_close must be positive where present")
         expiry = df[f"fut_{k}_expiry"]
         dte = df[f"fut_{k}_dte_days"]
+        has_sym = df[f"fut_{k}_symbol"].map(lambda x: isinstance(x, str) and x != "").to_numpy(bool)
+        if ((has_sym != expiry.notna().to_numpy()) | (has_sym != dte.notna().to_numpy())).any():
+            raise ValueError(f"fut_{k}: symbol, expiry and dte_days must be all present or all absent per row")
         both = expiry.notna() & dte.notna()
         if both.any():
             expected = (expiry[both] - pd.Series(idx, index=idx)[both]).dt.total_seconds() / 86400.0
