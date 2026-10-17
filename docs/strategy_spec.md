@@ -53,7 +53,7 @@ Notation: `S` spot, `P` perpetual, `F` quarterly, `τ` years to expiry, `r` USD 
 | Fair perpetual price | `P* = κ/(κ − (r − r′))·S` | He-Manela-Ross-von Wachter Prop. 1 |
 | Fair funding per period | `(P* − S)/S = (r − r′)/(κ − (r − r′)) ≈ (r − r′)/κ` | same |
 | Annualized fair funding | `f* = κ·(r − r′)/(κ − (r − r′)) ≈ r − r′` | same |
-| Trailing funding | `f̂ = κ · mean(last 90 prints)` | 30 days at 8h |
+| Trailing funding | `f̂ = mean over the trailing 30-day calendar window of per-print annualized funding`, each print annualized by its own interval (`rate × 8760 / interval_hours`, so 8h, 4h and 1h regimes are comparable); NaN until a full 30-day window exists, and NaN again if the funding feed stalls for more than one interval | 90 prints at 8h |
 | **Excess funding** | `e_fund = f̂ − f*` | — |
 | Annualized perp premium | `ρ = κ·ln(P/S)` | HMRW |
 | Fair premium | `ρ* = κ·ln(κ/(κ − (r − r′))) ≈ r − r′` | HMRW |
@@ -96,7 +96,14 @@ at bar `t` use data up to `t`'s close; fills happen at `t`'s close price ± slip
 Quarterly handling (S1, S3): enter the current quarter unless it is inside the roll window
 (`dte < 2` days), else the next quarter. Inside the roll window a held position rolls into the next
 quarter only if that contract clears its own hurdle; otherwise it exits. `cc_hold_to_expiry=False` by
-default (sensitivity: `True`, where the quarterly settles at the delivery price and pays the delivery fee).
+default (sensitivity: `True`, where the quarterly settles at the delivery price and pays the delivery fee;
+`cal_hold_to_expiry` is the S3 counterpart).
+
+Edge rules (frozen with the code, 2026-10-18 review): a NaN excess is "no decision" (no entry; an open
+position is held); `min_hold` counts from the original entry and a roll does not reset it; the S4 band is
+asymmetric (`κ·ln(1 − C) < −κ·ln(1 + C)`) and only its upper edge is used because the reverse trade needs
+a short-spot leg; the `allow_reverse` flag is reserved and has no effect on S1/S2/S4 in v1 (no borrow-cost
+model); S3 reverse is governed by `cal_allow_reverse`.
 
 Explicitly not done: parameter search on the full sample, sign flips, regime filters added after seeing
 results, or symbol selection after seeing results. The only post-hoc analysis is the sensitivity grid in
