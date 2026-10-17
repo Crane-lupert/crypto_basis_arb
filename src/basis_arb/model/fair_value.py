@@ -28,7 +28,7 @@ Binance mechanics (support article 360033525031): F = [avg premium + clamp(I - a
 """
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
@@ -40,8 +40,6 @@ from basis_arb.config import (
     DAYS_PER_YEAR,
     KAPPA,
 )
-
-_trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")
 
 
 def _ret(x):
@@ -130,7 +128,7 @@ def perp_price_random_maturity(
     s = np.linspace(0.0, horizon_years, n_steps)
     w = kappa * np.exp(-kappa * s)
     vals = np.asarray(expected_spot(s), float)
-    integral = _trapezoid(w * vals, s)
+    integral = np.trapezoid(w * vals, s)
     tail = np.exp(-kappa * horizon_years) * vals[-1]
     return float(integral + tail)
 
