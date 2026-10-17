@@ -8,7 +8,13 @@ import pandas as pd
 import pytest
 
 from basis_arb.backtest import metrics as mt
-from basis_arb.backtest.engine import PNL_COLUMNS, TRADE_COLUMNS, EVENT_COLUMNS, BacktestResult, run_backtest
+from basis_arb.backtest.engine import (
+    EVENT_COLUMNS,
+    PNL_COLUMNS,
+    TRADE_COLUMNS,
+    BacktestResult,
+    run_backtest,
+)
 from basis_arb.config import BacktestConfig
 from tests.conftest import make_panel
 

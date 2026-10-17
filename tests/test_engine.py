@@ -12,7 +12,12 @@ import pandas as pd
 import pytest
 
 from basis_arb.backtest.engine import (
-    PNL_COLUMNS, RESIZE_THRESHOLD, TRADE_COLUMNS, fills_frame, prepare_panel, run_backtest,
+    PNL_COLUMNS,
+    RESIZE_THRESHOLD,
+    TRADE_COLUMNS,
+    fills_frame,
+    prepare_panel,
+    run_backtest,
 )
 from basis_arb.backtest.run import STRATEGY_NAMES
 from basis_arb.backtest.sensitivity import FULL_GRID, REPLICATION_STRATEGIES, run_grid

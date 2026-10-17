@@ -187,8 +187,10 @@ pre-registered cell is marked and `N_configs` is recorded in the report so a rea
   `state/{ROOT}/events.jsonl`, heartbeat line every loop.
 * Testnet broker: HMAC-signed REST to `testnet.binancefuture.com` (futures) and `testnet.binance.vision`
   (spot). The mainnet trading hosts do not appear anywhere in `live/broker.py`; a test asserts this.
-  Quarterlies are not listed on the testnet, so S1/S3 are unsupported there; testnet fills are kept in a
-  ledger separate from paper P&L.
+  Quarterly listing on the testnet varies over time (`BTCUSDT_261225` was TRADING there on 2026-10-18); the
+  daemon checks the listing at each entry and skips a strategy with action UNSUPPORTED when its contract is
+  absent. State and ledgers are kept per mode (`state/{ROOT}/{paper|testnet}/`), so testnet fills never mix
+  with paper P&L. Known v1 gap: the daemon does not apply the §6 resize rule (fixed coin quantity per position).
 * Kill switches (fail-secure, block on uncertainty; never trade blind): quote age > 5 min → SAFE (no new
   entries, exits allowed); > 30 min → HALT **without** flattening (a hedge is not unwound on stale prices);
   any exception in the decision path → SAFE until restart; equity drawdown > 5% → SAFE, flatten only on a

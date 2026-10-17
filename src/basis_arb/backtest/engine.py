@@ -97,8 +97,17 @@ class BacktestResult:
 
 class _Leg:
     __slots__ = (
-        "leg", "instrument", "qty", "entry_exec", "entry_ref", "entry_bar", "expiry_ns",
-        "peak_adverse", "mark", "stale", "liq_move",
+        "entry_bar",
+        "entry_exec",
+        "entry_ref",
+        "expiry_ns",
+        "instrument",
+        "leg",
+        "liq_move",
+        "mark",
+        "peak_adverse",
+        "qty",
+        "stale",
     )
 
     def __init__(self, leg, instrument, qty, entry_exec, entry_ref, entry_bar, expiry_ns, liq_move):
@@ -117,8 +126,20 @@ class _Leg:
 
 class _Trip:
     __slots__ = (
-        "entry_bar", "direction", "contracts", "entry_excess", "qty",
-        "basis", "funding", "fees", "slippage", "delivery", "liq", "resize", "n_rolls", "n_resizes",
+        "basis",
+        "contracts",
+        "delivery",
+        "direction",
+        "entry_bar",
+        "entry_excess",
+        "fees",
+        "funding",
+        "liq",
+        "n_resizes",
+        "n_rolls",
+        "qty",
+        "resize",
+        "slippage",
     )
 
     def __init__(self, entry_bar, direction, contracts, entry_excess, qty):
@@ -611,15 +632,13 @@ class _Engine:
                     pair_loss += abs(lg.qty) * ent * adverse
                     if adverse > lg.peak_adverse:
                         lg.peak_adverse = adverse
-                        if adverse > self.peak_adverse:
-                            self.peak_adverse = adverse
+                        self.peak_adverse = max(self.peak_adverse, adverse)
                     u = adverse / move if adverse > 0.0 else 0.0
                     if util_i != util_i or u > util_i:
                         util_i = u
                     if lg.peak_adverse / move > self.peak_util:
                         self.peak_util, self.peak_util_bar = lg.peak_adverse / move, i
-                    if intra / move > self.peak_intrabar_util:
-                        self.peak_intrabar_util = intra / move
+                    self.peak_intrabar_util = max(self.peak_intrabar_util, intra / move)
                     if intra > move:
                         intrabar_breach = True
                     if isolated and lg.peak_adverse > move:

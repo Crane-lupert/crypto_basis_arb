@@ -81,4 +81,27 @@ decisions taken before the cited run, as spec **v1.0.2**:
     blind); drawdown > 5% → SAFE, flatten only on a margin-utilization breach; testnet fills in a separate
     ledger; quarterlies are unsupported on the testnet.
 
-Next entries: v1.0.2 results (pre-registered cell + grid), paper-live start date.
+## 2026-10-18 — v1.0.2 results (pre-registered cell; reports commit `36f7433`)
+
+Engine and daemon implement v1.0.2 (197 offline tests). Headline (excess of the T-bill on committed capital,
+flat days included): BTC S2 +2.77%/yr, excess Sharpe 3.14, max DD 2.00%, 5 round trips; ETH S2 +4.63%/yr,
+4.03, 1.25%; S1 +0.91% / +0.24% (Sharpe 0.26 / 0.07); S3 −1.55% / −1.67%; S4 −1.36% / −0.40% at VIP0.
+`N_configs` = 12 per strategy (small grid) + 3 HMRW replication cells for S2 and S4.
+
+What surprised: (1) S3 is negative after costs in both roots — trailing realized funding does not forecast
+the quarterly-vs-perp spread well enough to pay 28 bp per round trip; (2) S4 is inactive at VIP0 but trades
+39-157 times with +1.4% to +3.3% excess at HMRW's fee levels, so the replication cells, not the pre-registered
+cell, carry the HMRW comparison; (3) the T-bill convention (charged on committed capital while flat) is the
+dominant drag for every rule in 2022-23 and 2025-26; (4) the resize rule fired 13-43 times per strategy and
+root, i.e. the fixed-quantity drift the reviewer flagged was real; (5) no liquidation on close prices at 2×,
+peak utilization 0.56-0.68, zero intrabar breach bars; (6) the share of BTC funding prints exactly at 0.01%
+fell from 50.5% (2020) to 6.7% (2026). Direction check from the design audit: S2 raw Sharpe is positive in
+every year 2020-2024 (7.8, 14.0, 5.0, 3.5, 10.9) and lower in 2025-26 (3.4, 0.0), as predicted; in excess
+terms the flat years 2022-23 and 2025-26 are negative.
+
+Known gaps carried forward: the paper daemon does not apply the §6 resize rule (fixed coin quantity per
+position); `live/history.py` duplicates `data/`; the testnet broker is exercised only against mocked HTTP
+(no keys yet); quarterly listing on the testnet varies (`BTCUSDT_261225` was TRADING on 2026-10-18), so the
+daemon checks the listing at each entry.
+
+Next entries: paper-live start date and first 14-day operations review.

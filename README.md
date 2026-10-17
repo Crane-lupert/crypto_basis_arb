@@ -39,8 +39,43 @@ with Binance testnet order routing.
 ## Results
 
 <!-- RESULTS:BEGIN -->
-Pending: the first pre-registered run is written to `reports/` by `python -m basis_arb.backtest.run` and
-summarized here with a link to the report and the commit hash.
+Pre-registered cell of spec v1.0.2 (`git tag prereg-v1.0.2`): Binance VIP0 taker fees (10 / 5 bp) plus 2 bp
+slippage per leg, 10,000 USDT per leg, 2× leverage on the futures leg (isolated for the spot-leg strategies,
+cross for the futures pair), 2020-01-01 to 2026-10-17, hourly bars, same-bar fills. **Backtest, not live.**
+Headline figures are *excess of the 3-month T-bill*, charged on the capital committed to the strategy even on
+flat days (a rule that is rarely in position is penalised for idling its capital); raw figures assume idle cash
+earns nothing. Full report, year-by-year and stress-episode tables, P&L decomposition and the sensitivity grid:
+[`reports/BTCUSDT/summary.md`](reports/BTCUSDT/summary.md), [`reports/ETHUSDT/summary.md`](reports/ETHUSDT/summary.md)
+(commit `36f7433`).
+
+| | Strategy | Excess ann. return | Excess Sharpe | Raw Sharpe | Max DD | Round trips | Time in position |
+|---|---|---:|---:|---:|---:|---:|---:|
+| BTC | S1 cash-and-carry | 0.91% | 0.26 | 1.06 | 6.45% | 12 | 33% |
+| BTC | S2 funding carry | **2.77%** | **3.14** | 6.68 | 2.00% | 5 | 45% |
+| BTC | S3 calendar | −1.55% | −0.37 | 0.32 | 12.54% | 36 | 30% |
+| BTC | S4 random-maturity | −1.36% | −2.24 | 2.59 | 1.32% | 8 | 2% |
+| ETH | S1 cash-and-carry | 0.24% | 0.07 | 0.90 | 6.52% | 14 | 32% |
+| ETH | S2 funding carry | **4.63%** | **4.03** | 6.73 | 1.25% | 4 | 52% |
+| ETH | S3 calendar | −1.67% | −0.35 | 0.25 | 9.85% | 26 | 27% |
+| ETH | S4 random-maturity | −0.40% | −0.44 | 2.81 | 0.78% | 10 | 3% |
+
+What the numbers say:
+
+* **Funding carry (S2)** is the only rule that beats the T-bill after costs, and its edge sits in 2020-21
+  (BTC excess return 9.3% and 19.7%) and 2024 (0.7%); 2022-23 and 2025-26 are flat to negative in excess
+  terms. The share of BTC funding prints pinned at the 0.01% contract rate fell from 50.5% (2020) to 6.7%
+  (2026): the funding compression documented by Borri-Liu-Tsyvinski-Wu is visible in the raw prints.
+* **Cash-and-carry (S1)** captured the 2021 and 2024 basis spikes (BTC raw return 13.8% and 8.1% in those
+  years) and sat flat otherwise; its excess figure is small because committed capital idles for two thirds of
+  the sample.
+* **The calendar spread (S3)** loses after costs: trailing realized funding is a poor forecast of the
+  quarterly basis, and 36 round trips at 28 bp each consume the term premium.
+* **HMRW's random-maturity rule (S4)** barely trades at retail taker fees. At their fee levels it trades
+  39-157 times with +1.4% to +3.3% excess per year (replication cells in the report), reproducing their point
+  that fees decide this trade.
+* No liquidation at 2× in-sample on close prices (peak margin utilization 0.56-0.68). One-bar-lag fills, three
+  cost tiers, four buffers and three windows are in the sensitivity grid (`N_configs` = 12 per strategy plus
+  3 replication cells); the pre-registered cell is not the best cell.
 <!-- RESULTS:END -->
 
 ## Quick start
