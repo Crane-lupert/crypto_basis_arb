@@ -167,9 +167,10 @@ def test_hold_to_expiry_ignores_noise_exits_in_the_final_days():
     t = sg.cash_and_carry_targets(sg.enrich(p, cfg), cfg)
     assert (t.loc[final, "reason"] == "HOLD").all() and (t.loc[final, "contract"] == "SYN_CQ").all()
     assert t.loc[first_exp, "reason"] == "EXPIRY"
-    # without hold_to_expiry the same collapse exits (and then re-enters the next contract)
+    # without hold_to_expiry the roll window applies instead: the position rolls into the next contract
     t2 = sg.cash_and_carry_targets(sg.enrich(p, BacktestConfig()), BacktestConfig())
-    assert "EXIT" in set(t2.loc[final, "reason"])
+    assert "ROLL" in set(t2.loc[final, "reason"])
+    assert t2.loc[first_exp - pd.Timedelta(hours=1), "contract"] == "SYN_NQ"
 
 
 def test_validate_panel_rejects_grid_holes_and_partial_contract_rows():
