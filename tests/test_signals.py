@@ -137,6 +137,70 @@ def test_outage_rows_carry_no_decision():
     assert (sg.random_maturity_targets(e, cfg)["target"] == 0).all()
 
 
+def test_data_hole_on_held_contract_is_hold_not_expiry():
+    cfg = BacktestConfig()
+    base = make_panel(basis_ann_cq=0.20, basis_ann_nq=0.20)
+    hole = base.index[24 * 20]  # ~40 days before SYN_CQ expires
+    # (a) price hole only
+    p1 = base.copy()
+    p1.loc[hole, ["fut_cq_close", "fut_cq_high", "fut_cq_low"]] = np.nan
+    t1 = sg.cash_and_carry_targets(sg.enrich(p1, cfg), cfg)
+    assert t1.loc[hole, "reason"] == "HOLD" and t1.loc[hole, "target"] == 1 and t1.loc[hole, "contract"] == "SYN_CQ"
+    # (b) the whole contract slot missing for one bar (symbol + expiry + dte + prices)
+    p2 = base.copy()
+    cols = [c for c in p2.columns if c.startswith("fut_cq_")]
+    p2.loc[hole, cols] = np.nan
+    p2["fut_cq_symbol"] = p2["fut_cq_symbol"].where(p2["fut_cq_symbol"].notna(), None)
+    t2 = sg.cash_and_carry_targets(sg.enrich(p2, cfg), cfg)
+    assert t2.loc[hole, "reason"] == "HOLD" and t2.loc[hole, "contract"] == "SYN_CQ"
+    assert "EXPIRY" not in set(t2["reason"].iloc[: 24 * 58])  # nothing expires before the real expiry
+
+
+def test_hold_to_expiry_ignores_noise_exits_in_the_final_days():
+    cfg = BacktestConfig(params=StrategyParams(cc_hold_to_expiry=True))
+    p = make_panel(basis_ann_cq=0.20, basis_ann_nq=0.20)
+    first_exp = pd.Timestamp("2025-01-01", tz="UTC") + pd.Timedelta(days=60, hours=8)
+    final = (p.index > first_exp - pd.Timedelta(days=2)) & (p.index < first_exp)  # strictly inside the roll window
+    p.loc[final, "fut_cq_close"] = p.loc[final, "spot_close"]  # basis collapses to zero: excess < 0
+    p.loc[final, "fut_cq_high"] = p.loc[final, "fut_cq_close"] * 1.001
+    p.loc[final, "fut_cq_low"] = p.loc[final, "fut_cq_close"] * 0.999
+    t = sg.cash_and_carry_targets(sg.enrich(p, cfg), cfg)
+    assert (t.loc[final, "reason"] == "HOLD").all() and (t.loc[final, "contract"] == "SYN_CQ").all()
+    assert t.loc[first_exp, "reason"] == "EXPIRY"
+    # without hold_to_expiry the same collapse exits (and then re-enters the next contract)
+    t2 = sg.cash_and_carry_targets(sg.enrich(p, BacktestConfig()), BacktestConfig())
+    assert "EXIT" in set(t2.loc[final, "reason"])
+
+
+def test_validate_panel_rejects_grid_holes_and_partial_contract_rows():
+    p = make_panel(n_hours=48)
+    with pytest.raises(ValueError, match="1h grid"):
+        validate_panel(p.drop(p.index[10:15]))
+    q = make_panel(n_hours=48)
+    q.iloc[0, q.columns.get_loc("fut_cq_symbol")] = None  # expiry/dte still present
+    with pytest.raises(ValueError, match="all present or all absent"):
+        validate_panel(q)
+
+
+@pytest.mark.parametrize("strategy", ["cash_and_carry", "funding_carry", "calendar", "random_maturity"])
+def test_signals_are_causal_under_future_perturbation(strategy):
+    cfg = BacktestConfig()
+    base = make_panel(basis_ann_cq=0.15, basis_ann_nq=0.15, funding_per_period=0.0002, perp_premium=0.004)
+    k = 24 * 45
+    bumped = base.copy()
+    after = bumped.index >= bumped.index[k]
+    for col in ("spot_close", "spot_high", "spot_low", "perp_close", "perp_high", "perp_low",
+                "fut_cq_close", "fut_cq_high", "fut_cq_low", "fut_nq_close", "fut_nq_high", "fut_nq_low"):
+        bumped.loc[after, col] = bumped.loc[after, col] * 1.5
+    bumped.loc[after, "funding_rate"] = bumped.loc[after, "funding_rate"] * -3.0
+    bumped.loc[after, "r_usd"] = 0.08
+    ref = sg.build_targets(base, cfg, (strategy,))[strategy].iloc[:k]
+    alt = sg.build_targets(bumped, cfg, (strategy,))[strategy].iloc[:k]
+    assert ref["target"].tolist() == alt["target"].tolist()
+    assert ref["contract"].tolist() == alt["contract"].tolist()
+    assert ref["reason"].tolist() == alt["reason"].tolist()
+
+
 def test_nan_symbol_never_enters():
     cfg = BacktestConfig()
     p = sg.enrich(make_panel(basis_ann_cq=0.20), cfg)

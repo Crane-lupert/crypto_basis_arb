@@ -5,7 +5,8 @@ pricing literature and the cost-of-carry relation, compared with the **market ba
 spot-vs-futures positions. Deterministic backtest engine, pre-registered rules, and a paper-live daemon
 with Binance testnet order routing.
 
-> Status: backtest + paper-live. No real capital has been traded through this code, and the code cannot
+> Status: in progress — backtest engine and paper-live daemon implemented; the first pre-registered run
+> (spec v1.0.2) is being produced. No real capital has been traded through this code, and the code cannot
 > reach a real-money endpoint (see *Honesty and limits*).
 
 ## What it does
@@ -64,6 +65,13 @@ uv pip install --python .venv/Scripts/python.exe -e ".[dev]"     # Windows; use 
 * The carry documented by Schmeling-Schrimpf-Todorov (BIS WP 1087) is a risk premium that has compressed
   since 2024 (Borri-Liu-Tsyvinski-Wu, arXiv:2510.14435); results are reported by year and by stress episode
   for that reason.
+
+## How this was built
+
+The author directed an AI coding agent (Claude Code) and every commit carries the co-author trailer. The
+author set the scope, froze the strategy rules before any full-sample run (`git tag prereg-v1.0.2`),
+checked the theory mapping against the papers, commissioned two independent reviews (code-level and
+engineering-level) and applied their findings before the cited run. The spec and the tests are the contract.
 
 ## License
 

@@ -117,6 +117,18 @@ def test_trailing_funding_window_requires_full_calendar_window():
         fv.trailing_funding_ann_window(s, window_days=0.0)
 
 
+def test_trailing_funding_window_is_time_weighted_across_cadences():
+    # 25 days of 8h prints at 0.01% then 10 days of 1h prints at 0.0375%: realized over the last 30 days
+    idx8 = pd.date_range("2025-01-01", periods=75, freq="8h", tz="UTC")
+    idx1 = pd.date_range(idx8[-1] + pd.Timedelta(hours=1), periods=240, freq="1h", tz="UTC")
+    s = pd.concat([pd.Series(1e-4, index=idx8), pd.Series(3.75e-4, index=idx1)])
+    out = fv.trailing_funding_ann_window(s, window_days=30.0)
+    # window (t-30d, t] at the last stamp holds the last 60 eight-hour prints (20 days) plus all 240 one-hour prints
+    expected = (60 * 1e-4 + 240 * 3.75e-4) * 365 / 30
+    assert out.iloc[-1] == pytest.approx(expected, rel=1e-9)
+    assert out.iloc[-1] < 1.3  # a per-print mean would have given ~2.65
+
+
 def test_annualized_basis_nan_for_non_positive_prices():
     assert np.isnan(fv.annualized_basis(0.0, 100.0, 0.5))
     assert np.isnan(fv.annualized_basis(-1.0, 100.0, 0.5))

@@ -59,8 +59,9 @@ a constant underlying rate `r′`, and `κ > r − r′`:
   cost-implied band, close when it first returns to zero. The holding period is random (hence the name).
   Their Table 5 reports Sharpe ratios on Binance hourly data (2020 to 2024-03-11): BTC 3.53 (no fees),
   2.20 / 2.16 / 1.80 at low / medium / high fee tiers; ETH 4.83 → 2.55; BNB, DOGE and ADA higher.
-  The high fee tier is 6.75 bp spot and 1.44 bp futures; their risk-free rate is the average Aave
-  stablecoin supply/borrow rate.
+  Their fee levels (Table 10) are 2.25/0.18, 4.5/0.72 and 6.75/1.44 bp for spot/futures, well below the
+  VIP0 taker costs (10/5 bp plus slippage) used here, which is why this repository runs those levels as
+  labelled replication cells for S4. Their risk-free rate is the average Aave stablecoin supply/borrow rate.
 * **Empirics:** deviations of crypto perpetuals from the benchmark are far larger than deviations in
   traditional currency markets, co-move across coins, and shrink as the market matures.
 
@@ -79,7 +80,8 @@ expected spot price at a *random* future date whose distribution reflects how st
 contract to spot; some funding designs make futures and spot coincide, and the contract can be replicated
 by dynamic trading in the underlying.
 
-For the continuous-time linear-funding case the random date is exponential with rate `κ`, so
+For the continuous-time linear-funding case (our own specialisation of their result; the paper covers
+discrete time and inverse/quanto contracts in general) the random date is exponential with rate `κ`, so
 `F_t = κ ∫_0^∞ e^{−κ s} E_t^Q[S_{t+s}] ds`: the perpetual is a `κ e^{−κs}`-weighted average of dated
 futures prices. `perp_price_random_maturity` evaluates this integral numerically, and the unit tests
 check that with `E^Q[S_{t+s}] = S e^{(r − r′) s}` it reproduces Proposition 1 above. The same
@@ -109,11 +111,17 @@ Binance USDⓈ-M funding (support article 360033525031):
     cap / floor       = ± 0.75 × maintenance margin ratio at max leverage  (BTC, ETH: ± 0.30%)
     funding amount    = mark-price notional × F, paid only by positions open at the stamp
 
-`P̄` is a time-weighted average over the interval (weights 1..n). The interest component `I` is the
-exchange's assumed USDT-minus-coin rate differential; the theory in §2 replaces this fixed 0.01% with the
-observed `(r − r′)/κ`. Since 2025-05 a contract moves to 1-hour settlement after a capped print and
-(since 2026-01) back to 4-hour after 16 calm prints; the panel therefore keeps the *actual* stamps from the
-funding-history endpoint rather than assuming 8 hours.
+`P̄` is a time-weighted average over the interval (weights 1..n). Because of the clamp, the print equals
+exactly `I = 0.01%` (10.95% per year) whenever `P̄` lies inside `[−0.04%, +0.06%]`: the interest component
+is a **contract term**, not a market rate (HMRW make the same observation: "when the premium index is close
+to the interest rate 0.01%, the funding is fixed at the interest rate"). The equilibrium funding `(r − r′)/κ`
+of §2 is the benchmark that realized funding is compared with, and the gap between the contract's 10.95%
+and the benchmark (2-3× the 2024-26 T-bill rate) is a rent that strategy S2 treats as a risk premium
+(exchange risk, locked capital, the true cost of stablecoin funding), never as a free lunch. The support
+article as read on 2026-10-18 also states that a contract moves to 1-hour settlement after a capped print
+(since 2025-05) and back to 4-hour after sixteen calm prints (since 2026-01); the panel therefore keeps the
+*actual* stamps from the funding-history endpoint rather than assuming 8 hours (none of the BTC/ETH prints
+in the 2020-26 sample deviate from 8 hours).
 
 Quarterly delivery contracts (`ROOT_YYMMDD`) expire at 08:00 UTC on the last Friday of March, June,
 September and December. The settlement price is the average of the index over the final 30 minutes
@@ -123,11 +131,14 @@ of the expiry bar as a proxy and charges the delivery fee.
 
 ## 4. Inputs for `r` and `r′`
 
-* `r`: 3-month US T-bill (FRED `DTB3`, discount basis, keyless CSV). HMRW use Aave stablecoin rates,
-  which track T-bills loosely but are not available keyless with history. The difference (a stablecoin
-  spread of a few percent in 2021, near zero in 2024-26) is an acknowledged source of error in `b*`.
-* `r′ = y`: 0 for BTC. For ETH a constant 3% staking proxy is used; the true staking yield drifted from
-  about 4-5% (2022-23) to about 3% (2025-26), so a time series would be a strict improvement.
+* `r`: 3-month US T-bill (FRED `DTB3`, discount basis, keyless CSV; the observation for day `d` applies
+  from `d + 1` 00:00 UTC). HMRW use Aave stablecoin rates, which are not available keyless with history.
+  Stablecoin lending rates ran several percentage points above T-bills during the 2021 leverage boom, so
+  `b*` is probably understated and the measured excess basis overstated in that period; this is an
+  acknowledged source of error, reported rather than corrected.
+* `r′ = y`: 0 for both coins in decisions and P&L, because the spot leg is held unstaked. The ETH
+  staking proxy (about 4-5% in 2022-23, about 3% in 2025-26) is kept only as a diagnostic: if the spot leg
+  were staked, ETH's fair basis would be lower by that yield and the excess basis correspondingly higher.
 
 ## 5. Related work consulted but not used as an anchor
 
