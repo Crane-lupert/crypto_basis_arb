@@ -234,7 +234,7 @@ def live_row_ts(quote_ts: Any) -> pd.Timestamp:
 def _missing(dtype: Any) -> Any:
     if isinstance(dtype, pd.DatetimeTZDtype) or (isinstance(dtype, np.dtype) and dtype.kind == "M"):
         return pd.NaT
-    if dtype == object:
+    if dtype is np.dtype(object) or str(dtype) == "object":
         return None
     return np.nan
 

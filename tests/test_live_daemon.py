@@ -237,7 +237,9 @@ def test_recent_panel_satisfies_the_contract_and_the_selection_rule():
     fr = p["funding_rate"].dropna()
     assert (fr == 0.0001).all() and set(fr.index.hour) == {0, 8, 16} and len(fr) == 135
     # expiry hand-off: the expired 260925 leaves at its expiry bar, nq is empty until 270326's first bar
-    at = lambda t: p.loc[pd.Timestamp(t, tz="UTC")]
+    def at(t):
+        return p.loc[pd.Timestamp(t, tz="UTC")]
+
     assert (at("2026-09-25 07:00")["fut_cq_symbol"], at("2026-09-25 07:00")["fut_nq_symbol"]) == (
         "BTCUSDT_260925", "BTCUSDT_261225")
     assert at("2026-09-25 08:00")["fut_cq_symbol"] == "BTCUSDT_261225" and at("2026-09-25 08:00")["fut_nq_symbol"] is None
