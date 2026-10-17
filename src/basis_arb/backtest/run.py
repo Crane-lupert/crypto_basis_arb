@@ -103,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{args.root}: {panel.index[0]} .. {panel.index[-1]} ({len(panel):,} bars), backtest")
     print(headline_markdown(summaries))
     if sens is not None:
-        print(f"sensitivity: N_configs = {sens.attrs['n_configs']} cells x {len(strategies)} strategies")
+        print(f"sensitivity: N_configs = {sens.attrs['n_configs']} grid cells x {len(strategies)} strategies"
+              f" + {sens.attrs.get('n_replication_cells', 0)} HMRW replication cells")
     print(f"report: {paths['summary']}")
     return 0
 

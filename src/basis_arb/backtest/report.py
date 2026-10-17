@@ -1,8 +1,9 @@
-"""Backtest report: summary.md, metrics.json, trades_{strategy}.csv and PNG figures.
+"""Backtest report: summary.md, metrics.json, trades_{strategy}.csv and PNG figures (spec v1.0.2).
 
-Figures are drawn with matplotlib's Agg canvas directly (no pyplot, no global backend switch).
-Colors: categorical slots 1-4 of the reference data-viz palette in fixed strategy order; text and
-reference lines use neutral ink so that color only carries series identity.
+Headline figures are excess of the T-bill; raw figures come second. Figures are drawn with matplotlib's Agg
+canvas directly (no pyplot, no global backend switch). Colors: categorical slots 1-4 of the reference
+data-viz palette in fixed strategy order; text and reference lines use neutral ink so that color only
+carries series identity.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from basis_arb.backtest import metrics as mt
-from basis_arb.backtest.engine import BacktestResult
+from basis_arb.backtest.engine import RESIZE_THRESHOLD, BacktestResult
 from basis_arb.config import FUNDING_INTERVAL_HOURS, KAPPA, BacktestConfig
 from basis_arb.model import fair_value as fv
 from basis_arb.types import STRATEGIES, STRATEGY_LEGS
@@ -47,33 +48,39 @@ STRATEGY_LABELS = {
 DEFAULT_SPEC_PATH = Path(__file__).resolve().parents[3] / "docs" / "strategy_spec.md"
 
 ENGINE_ASSUMPTIONS = (
-    "Capital unit per strategy: spot leg = notional; each futures leg = notional / its leverage "
-    "(spec: spot-leg strategies notional x (1 + 1/leverage), S3 2 x notional / leverage). "
-    "Returns are P&L / capital, not compounded; idle cash earns nothing.",
-    "Equal coin quantity on both legs: qty = notional_per_leg / close of the first leg at the entry bar "
-    "(spot for S1/S2/S4, perpetual for S3).",
-    "Fills at close x (1 +/- slippage); fees are charged on the executed notional. The P&L 'basis' "
-    "component is the mark-to-market at reference (close) prices, so slippage appears under fees.",
-    "Bar order: mark, settle expiries, funding, margin monitor, trade. Funding is paid to perp legs held "
-    "before the bar's trades (a leg opened on a stamp bar does not receive that stamp; a leg closed on a "
-    "stamp bar does).",
-    "Expiry: a held quarterly with expiry <= ts settles at spot_close with the delivery fee; the remaining "
-    "leg is closed on the same bar at close +/- slippage (round trip exit_reason EXPIRY).",
-    "Margin monitor: worst adverse close/high/low move since entry, excluding the entry bar's own range. "
-    "Isolated mode liquidates a leg whose move exceeds 1/leverage - maintenance at that trigger price "
-    "(+/- slippage, taker fee) plus the liquidation penalty; the other leg is closed at close +/- slippage. "
-    "Utilization = adverse move / (1/leverage - maintenance): 1.0 is the isolated liquidation point. "
-    "Cross-collateral mode never liquidates and reports peak utilization.",
-    "After a forced close (expiry or liquidation) the engine stays flat until the target's "
-    "(direction, contract) pair changes; it never re-enters on the bar of the forced close.",
+    "Headline = excess of the T-bill: the risk-free rate accrues hourly at r_usd/8760 on the previous bar's "
+    "capital ((mean r of the day)/365 x capital for a full day), including flat days, because the capital is "
+    "committed to the strategy. Raw figures (idle cash earns nothing) are reported second.",
+    "Capital = capital actually required by the open position, re-measured each bar: spot value + futures "
+    "notional / leverage (S3: both futures legs at their leverage); the target capital while flat. "
+    "Hourly return = P&L / previous bar's capital; daily return = sum of hourly returns (no compounding).",
+    "Equal coin quantity on both legs: qty = notional_per_leg / close of the first leg (spot for S1/S2/S4, "
+    "perpetual for S3). Fills at close x (1 +/- slippage) with fees on the executed notional; the 'basis' "
+    "component is marked at reference (close) prices, so slippage appears under fees.",
+    "Bar order: mark, settle expiries, funding, margin monitor, trade, resize. Funding is paid to perp legs held "
+    "before the bar's trades (a leg opened on a stamp bar does not receive that stamp; a leg closed on a stamp "
+    "bar does). Decisions are filled fill_lag_bars bars later (0 pre-registered).",
+    "Expiry: a held quarterly with expiry <= ts settles at spot_close with the delivery fee; the remaining leg "
+    "is closed on the same bar at close +/- slippage (round trip exit_reason EXPIRY).",
+    "Margin monitor on CLOSE prices: worst adverse close move since entry (or since the last resize). Isolated "
+    "mode (S1/S2/S4 by default) liquidates a leg whose move exceeds 1/leverage - maintenance at that bar's close "
+    "(+/- slippage, taker fee, liquidation penalty) and closes the other leg. S3 uses futures_pair_mode "
+    "(cross_collateral: no per-leg liquidation). The intrabar high/low worst case never triggers; it is "
+    "counted as a diagnostic. Utilization = adverse close move / (1/leverage - maintenance).",
+    f"Resize: at a funding stamp, if |pair notional / target - 1| > {RESIZE_THRESHOLD:.0%} (pair notional = |qty| x "
+    "close of the first leg), both legs are traded back to the target notional at close +/- slippage with "
+    "fees (P&L component 'resize'); the futures margin is re-established, so the margin monitor restarts.",
+    "After a forced close (expiry or liquidation) the engine stays flat until the target's (direction, "
+    "contract) pair changes; it never re-enters on the bar of the forced close.",
     "A roll closes the old quarterly and opens the next one (same coin quantity) on the same bar; the "
     "spot/perp leg is untouched and the round trip continues (contract column 'A>B').",
-    "A futures leg without a price on a bar keeps its last mark (closing at it logs STALE_PRICE); an entry "
-    "or roll into an unpriced contract is skipped (NO_PRICE) and retried on the next bar.",
+    "A futures leg without a price on a bar keeps its last mark (closing at it logs STALE_PRICE; a resize waits "
+    "for a priced stamp); an entry or roll into an unpriced contract is skipped (NO_PRICE) and retried.",
     "Positions open on the last bar are marked to market without exit costs (trades exit_reason OPEN; "
     "excluded from round-trip counts and hit rate).",
-    "Daily P&L by UTC day; the bar closing at 00:00 UTC belongs to the previous day. Sharpe = "
-    "mean/std x sqrt(365) on daily P&L. Max drawdown is a fraction of the running equity peak.",
+    "Daily figures by UTC day; the bar closing at 00:00 UTC belongs to the previous day. Sharpe = mean/std x "
+    "sqrt(365) of daily returns; an identically zero series has Sharpe 0. Max drawdown is a fraction of the "
+    "running equity peak.",
 )
 
 
@@ -205,16 +212,17 @@ def _save(fig, path: Path) -> None:
 
 
 def plot_equity(results: dict[str, BacktestResult], path: Path, root: str) -> None:
+    """Headline curve: cumulative excess return over the T-bill (sum of hourly excess returns)."""
     fig, (ax,) = _new_figure()
     ends = []
     for k, (name, res) in enumerate(results.items()):
-        y = (res.equity - res.capital) / res.capital * 100.0
+        y = mt.hourly_frame(res)["excess_ret"].cumsum() * 100.0
         ax.plot(_x(y.index), y.to_numpy(), color=_color(name, k), linewidth=LINE_W, label=_label(name))
         if len(y):
             ends.append((float(y.iloc[-1]), f"{_label(name).split()[0]} {y.iloc[-1]:+.1f}%"))
     ax.axhline(0.0, color=AXIS, linewidth=0.8)
-    ax.set_ylabel("cumulative P&L / capital (%)", color=TEXT2, fontsize=8)
-    _title(ax, f"{root}: cumulative P&L / capital (backtest)")
+    ax.set_ylabel("cumulative excess return (%)", color=TEXT2, fontsize=8)
+    _title(ax, f"{root}: cumulative return over the T-bill (backtest)")
     _legend(ax, ncol=2)
     _direct_labels(ax, ends)
     _save(fig, path)
@@ -293,7 +301,7 @@ def plot_theory_vs_market(enriched: pd.DataFrame, cfg: BacktestConfig, path: Pat
 
 
 # --- markdown --------------------------------------------------------------------------------------
-def _spec_excerpt(spec_path: Path | None, sections: tuple[str, ...] = ("4", "6")) -> str | None:
+def _spec_excerpt(spec_path: Path | None, sections: tuple[str, ...] = ("4", "6", "7")) -> str | None:
     path = spec_path or DEFAULT_SPEC_PATH
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -309,64 +317,68 @@ def _spec_excerpt(spec_path: Path | None, sections: tuple[str, ...] = ("4", "6")
     return "\n".join(out).strip() or None
 
 
+HEADLINE_HEADER = [
+    "Strategy", "Excess ann. return", "Excess Sharpe", "Raw ann. return", "Raw Sharpe", "Max DD", "Round trips",
+    "Hit rate", "Avg hold (h)", "Time in position", "Turnover (x/yr)", "Worst 30d", "Liquidations", "Resizes",
+]
+
+
 def _headline_rows(summaries: dict[str, dict]) -> list[list[str]]:
     rows = []
     for name, s in summaries.items():
         rows.append([
-            _label(name), _pct(s["ann_return_on_capital"]), _num(s["sharpe"]), _pct(s["max_dd"]),
-            _int(s["n_round_trips"]), _pct(s["hit_rate"], 0), _num(s["avg_hold_hours"], 0),
-            _pct(s["time_in_position_frac"], 0), _num(s["turnover"], 1), _pct(s["worst_30d"]),
-            _int(s["n_liquidations"]),
+            _label(name), _pct(s["ann_excess_return"]), _num(s["excess_sharpe"]), _pct(s["ann_return_raw"]),
+            _num(s["sharpe_raw"]), _pct(s["max_dd"]), _int(s["n_round_trips"]), _pct(s["hit_rate"], 0),
+            _num(s["avg_hold_hours"], 0), _pct(s["time_in_position_frac"], 0), _num(s["turnover"], 1),
+            _pct(s["worst_30d"]), _int(s["n_liquidations"]), _int(s["n_resizes"]),
         ])
     return rows
-
-
-HEADLINE_HEADER = [
-    "Strategy", "Ann. return on capital", "Sharpe", "Max DD", "Round trips", "Hit rate", "Avg hold (h)",
-    "Time in position", "Turnover (x/yr)", "Worst 30d", "Liquidations",
-]
 
 
 def headline_markdown(summaries: dict[str, dict]) -> str:
     return _md_table(HEADLINE_HEADER, _headline_rows(summaries))
 
 
+def _window_cells(r) -> list[str]:
+    return [
+        _int(r["n_days"]), _num(r["pnl"]), _pct(r["ret"]), _pct(r["excess_ret"]), _num(r["sharpe_raw"]),
+        _num(r["excess_sharpe"]), _pct(r["max_dd"]), _num(r["pnl_basis"]), _num(r["pnl_funding"]),
+        _num(r["pnl_costs"]), _int(r["n_round_trips"]), _pct(r["time_in_position"], 0), _int(r["n_liquidations"]),
+        _int(r["n_resizes"]),
+    ]
+
+
+_WINDOW_HEADER = ["Days", "P&L (USDT)", "Return", "Excess return", "Raw Sharpe", "Excess Sharpe", "Max DD", "Basis",
+                  "Funding", "Costs", "Round trips", "Time in position", "Liquidations", "Resizes"]
+
+
 def _yearly_md(df: pd.DataFrame) -> str:
-    rows = [[
-        str(y), _int(r["n_days"]), _num(r["pnl"]), _pct(r["ret_on_capital"]), _num(r["sharpe"]),
-        _pct(r["max_dd"]), _num(r["pnl_basis"]), _num(r["pnl_funding"]), _num(r["pnl_costs"]),
-        _int(r["n_round_trips"]), _pct(r["time_in_position"], 0), _int(r["n_liquidations"]),
-    ] for y, r in df.iterrows()]
-    header = ["Year", "Days", "P&L (USDT)", "Return", "Sharpe", "Max DD", "Basis", "Funding", "Costs",
-              "Round trips", "Time in position", "Liquidations"]
-    return _md_table(header, rows)
+    rows = [[str(y)] + _window_cells(r) for y, r in df.iterrows()]
+    return _md_table(["Year"] + _WINDOW_HEADER, rows)
 
 
 def _episode_md(df: pd.DataFrame) -> str:
     rows = []
     for name, r in df.iterrows():
+        window = f"{r['start']} .. {r['end']}"
         if not r["n_days"]:
-            rows.append([name, f"{r['start']} .. {r['end']}", "0%"] + ["not in sample"] + [""] * 7)
+            rows.append([name, window, "0%", "not in sample"] + [""] * (len(_WINDOW_HEADER) - 1))
             continue
-        rows.append([
-            name, f"{r['start']} .. {r['end']}", _pct(r["coverage"], 0), _num(r["pnl"]), _pct(r["ret_on_capital"]),
-            _pct(r["max_dd"]), _num(r["pnl_basis"]), _num(r["pnl_funding"]), _num(r["pnl_costs"]),
-            _pct(r["time_in_position"], 0), _int(r["n_liquidations"]),
-        ])
-    header = ["Episode", "Window (UTC days)", "Coverage", "P&L (USDT)", "Return", "Max DD", "Basis", "Funding",
-              "Costs", "Time in position", "Liquidations"]
-    return _md_table(header, rows)
+        rows.append([name, window, _pct(r["coverage"], 0)] + _window_cells(r))
+    return _md_table(["Episode", "Window (UTC days)", "Coverage"] + _WINDOW_HEADER, rows)
 
 
 def _decomposition_md(results: dict[str, BacktestResult], summaries: dict[str, dict]) -> str:
     rows = []
     for name, s in summaries.items():
         rows.append([
-            _label(name), _num(results[name].capital, 0), _num(s["pnl_basis"]), _num(s["pnl_funding"]),
-            _num(s["pnl_fees"]), _num(s["pnl_delivery"]), _num(s["pnl_liquidation"]), _num(s["pnl_total"]),
+            _label(name), _num(results[name].capital, 0), _num(s["mean_capital"], 0), _num(s["pnl_basis"]),
+            _num(s["pnl_funding"]), _num(s["pnl_fees"]), _num(s["pnl_delivery"]), _num(s["pnl_liquidation"]),
+            _num(s["pnl_resize"]), _num(s["pnl_total"]), _num(-s["rf_charge_total"]), _num(s["excess_pnl_total"]),
         ])
-    header = ["Strategy", "Capital", "Basis convergence", "Funding", "Fees + slippage", "Delivery fees",
-              "Liquidation penalties", "Total"]
+    header = ["Strategy", "Target capital", "Mean capital", "Basis convergence", "Funding", "Fees + slippage",
+              "Delivery fees", "Liquidation penalties", "Resize costs", "Total P&L", "T-bill on capital",
+              "Excess P&L"]
     return _md_table(header, rows)
 
 
@@ -378,10 +390,21 @@ def _margin_md(results: dict[str, BacktestResult]) -> str:
         lev = ", ".join(f"{leg} {m[f'{leg}_leverage']:g}x" for leg in legs)
         rows.append([
             _label(name), m["mode"], lev, _num(m["peak_utilization"], 3), _int(m["bars_above_isolated_threshold"]),
-            _int(m["n_liquidations"]),
+            _int(m["intrabar_breach_bars"]), _num(m["peak_intrabar_utilization"], 3),
+            _num(m["peak_pair_utilization"], 3), _int(m["n_liquidations"]), _int(m["n_resizes"]),
         ])
-    header = ["Strategy", "Margin mode", "Leverage", "Peak utilization", "Bars above isolated threshold",
-              "Liquidations"]
+    header = ["Strategy", "Margin mode", "Leverage", "Peak utilization (close)", "Bars above isolated threshold",
+              "Intrabar breach bars (diagnostic)", "Peak intrabar utilization", "Peak pair utilization",
+              "Liquidations", "Resizes"]
+    return _md_table(header, rows)
+
+
+def _funding_md(diag: pd.DataFrame) -> str:
+    rows = [[
+        str(y), _int(r["n_prints"]), _pct(r["share_at_0.0001"], 1), _int(r["n_1h"]), _int(r["n_4h"]), _int(r["n_8h"]),
+        _int(r["n_other"]),
+    ] for y, r in diag.iterrows()]
+    header = ["Year", "Funding prints", "Share exactly 0.000100", "1h gaps", "4h gaps", "8h gaps", "Other gaps"]
     return _md_table(header, rows)
 
 
@@ -393,8 +416,8 @@ def _assumptions_md(cfg: BacktestConfig, spec_path: Path | None) -> str:
         f"- Notional per leg: {cfg.notional_per_leg:,.0f} USDT; costs: spot fee {c.spot_fee_bps:g} bp, futures fee "
         f"{c.fut_fee_bps:g} bp, slippage {c.slippage_bps:g} bp per leg, delivery fee {c.delivery_fee_bps:g} bp, "
         f"liquidation penalty {c.liquidation_penalty_bps:g} bp.",
-        f"- Margin: mode {m.mode}, perp leverage {m.perp_leverage:g}x, quarterly leverage {m.fut_leverage:g}x, "
-        f"maintenance {m.maintenance_margin_frac:.2%}.",
+        f"- Margin: spot-leg strategies {m.mode}, futures pair (S3) {getattr(m, 'futures_pair_mode', m.mode)}; perp "
+        f"leverage {m.perp_leverage:g}x, quarterly leverage {m.fut_leverage:g}x, maintenance {m.maintenance_margin_frac:.2%}.",
         f"- Strategy parameters: {dataclasses.asdict(cfg.params)}",
         "",
         "### Engine implementation choices",
@@ -403,7 +426,7 @@ def _assumptions_md(cfg: BacktestConfig, spec_path: Path | None) -> str:
     lines += [f"- {a}" for a in ENGINE_ASSUMPTIONS]
     excerpt = _spec_excerpt(spec_path)
     if excerpt:
-        lines += ["", "### Pre-registered spec excerpt (docs/strategy_spec.md, sections 4 and 6, verbatim)", "",
+        lines += ["", "### Pre-registered spec excerpt (docs/strategy_spec.md, sections 4, 6 and 7, verbatim)", "",
                   excerpt]
     else:
         lines += ["", "(docs/strategy_spec.md not found next to the package; spec excerpt omitted.)"]
@@ -431,6 +454,7 @@ def write_report(
     summaries = {s: mt.summarize(r) for s, r in results.items()}
     yearly = {s: mt.yearly_table(r) for s, r in results.items()}
     episodes = {s: mt.episode_table(r) for s, r in results.items()}
+    funding_diag = mt.funding_diagnostics(enriched_panel)
     paths: dict[str, Path] = {}
 
     for s, r in results.items():
@@ -446,13 +470,15 @@ def write_report(
     plot_theory_vs_market(enriched_panel, cfg, paths["theory_png"], root)
 
     first = next(iter(summaries.values()))
-    n_configs, grid_mode, grid_md = 1, "none", None
+    n_configs, n_rep, grid_mode, grid_md, rep_md = 1, 0, "none", None, None
     if sensitivity is not None and len(sensitivity):
-        from basis_arb.backtest.sensitivity import grid_summary_markdown
+        from basis_arb.backtest.sensitivity import grid_summary_markdown, replication_markdown
 
         n_configs = int(sensitivity.attrs.get("n_configs", sensitivity["cell_id"].nunique()))
+        n_rep = int(sensitivity.attrs.get("n_replication_cells", 0))
         grid_mode = str(sensitivity.attrs.get("mode", "?"))
         grid_md = grid_summary_markdown(sensitivity)
+        rep_md = replication_markdown(sensitivity)
 
     md = [
         f"# Backtest report: {root}",
@@ -460,15 +486,18 @@ def write_report(
         "Backtest (simulated taker fills on historical hourly bars), not paper or live results.",
         f"Sample {first['start']} to {first['end']} ({first['n_bars']:,} hourly bars, {first['years']:.2f} years)"
         + (f", panel `{panel_path}`." if panel_path else "."),
-        f"Capital unit: {cfg.notional_per_leg:,.0f} USDT per leg, equal coin quantity on both legs. All figures are net "
-        "of fees, slippage, delivery fees and liquidation penalties.",
+        f"Target size: {cfg.notional_per_leg:,.0f} USDT per leg, equal coin quantity on both legs, resized to target "
+        f"when the pair notional drifts more than {RESIZE_THRESHOLD:.0%}. All figures are net of fees, slippage, "
+        "delivery fees, liquidation penalties and resize costs.",
         "",
-        "## Headline",
+        "## Headline (excess of the T-bill)",
         "",
         headline_markdown(summaries),
         "",
-        "Ann. return = total P&L / capital / years. Worst 30d = worst rolling 30-day P&L / capital. Turnover = "
-        "traded notional / capital per year. Round trips exclude a position still open on the last bar.",
+        "Excess ann. return = total excess return / years, where the excess return deducts the T-bill rate (panel "
+        "r_usd) on the capital in use, flat days included. Raw figures assume idle cash earns nothing. Worst 30d = "
+        "worst rolling 30-day sum of daily raw returns. Turnover = traded notional / mean capital per year. Round "
+        "trips exclude a position still open on the last bar.",
         "",
         "## P&L decomposition (USDT, whole sample)",
         "",
@@ -478,38 +507,58 @@ def write_report(
         "",
         _margin_md(results),
         "",
+        "Liquidation is decided on close prices; 'intrabar breach bars' counts bars whose high/low would have "
+        "crossed the isolated threshold (diagnostic only, never triggers). Peak pair utilization = net loss of the "
+        "two futures legs / their posted margin (S3).",
+        "",
         "## Year by year",
         "",
         "Bars are labeled by close time, so the bar closing at 00:00 UTC on 1 January belongs to the previous year "
-        "(a sample starting at 00:00 shows a one-bar row for that year). Round trips are counted in the year they "
-        "close; costs = fees + slippage + delivery fees + liquidation penalties.",
+        "(a sample starting at 00:00 shows a one-bar row for that year). Returns are period sums (not "
+        "annualized); round trips are counted in the year they close; costs = fees + slippage + delivery + "
+        "liquidation + resize.",
     ]
     for s in results:
         md += ["", f"### {_label(s)}", "", _yearly_md(yearly[s])]
     md += ["", "## Stress episodes"]
     for s in results:
         md += ["", f"### {_label(s)}", "", _episode_md(episodes[s])]
-    md += ["", "## Sensitivity grid", ""]
+    md += [
+        "",
+        "## Funding diagnostics",
+        "",
+        "Share of funding prints exactly equal to 0.000100 (Binance's interest component: the average premium sat "
+        "inside the clamp band) and the cadence of prints (hours since the previous print), by year of the print.",
+        "",
+        _funding_md(funding_diag),
+        "",
+        "## Sensitivity grid",
+        "",
+    ]
     if grid_md is None:
         md.append("Not run for this report (`--grid none`): N_configs = 1 (the pre-registered cell only).")
     else:
         md += [
-            f"Mode `{grid_mode}`: **N_configs = {n_configs}** cells per strategy x {len(results)} strategies. "
-            "Discount the best cell accordingly; the full grid is in `sensitivity.md` / `sensitivity.csv`.",
+            f"Mode `{grid_mode}`: **N_configs = {n_configs}** grid cells per strategy x {len(results)} strategies"
+            + (f", plus {n_rep} HMRW replication cells for S4 and S2" if n_rep else "")
+            + ". Discount the best cell accordingly; the full grid is in `sensitivity.md` / `sensitivity.csv`.",
             "",
             grid_md,
         ]
+        if rep_md:
+            md += ["", "HMRW replication cells (HMRW's fee levels, no slippage; other settings pre-registered):", "",
+                   rep_md]
     md += [
         "",
         "## Figures",
         "",
-        "![Cumulative return on capital](equity_curves.png)",
+        "![Cumulative return over the T-bill](equity_curves.png)",
         "",
-        "Cumulative P&L divided by each strategy's capital unit, hourly, net of all costs.",
+        "Cumulative sum of hourly excess returns (return on the capital in use minus the T-bill), net of all costs.",
         "",
         "![Drawdown](drawdown.png)",
         "",
-        "Drawdown from the running equity peak; one panel per strategy, worst value of each UTC day.",
+        "Drawdown from the running equity peak (raw P&L); one panel per strategy, worst value of each UTC day.",
         "",
         "![Theory vs market](theory_vs_market.png)",
         "",
@@ -530,9 +579,12 @@ def write_report(
         "root": root,
         "panel": panel_path,
         "kind": "backtest",
+        "headline": "excess of the T-bill (ann_excess_return, excess_sharpe); raw figures: ann_return_raw, sharpe_raw",
         "config": dataclasses.asdict(cfg),
         "n_configs": n_configs,
+        "n_replication_cells": n_rep,
         "grid_mode": grid_mode,
+        "funding_diagnostics": _frame_records(funding_diag, "year"),
         "strategies": {
             s: {
                 "summary": summaries[s],

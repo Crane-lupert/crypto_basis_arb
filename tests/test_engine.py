@@ -1,6 +1,7 @@
-"""Backtest engine tests on deterministic synthetic panels (tests.conftest.make_panel)."""
+"""Backtest engine tests on deterministic synthetic panels (tests.conftest.make_panel), spec v1.0.2."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import subprocess
@@ -10,8 +11,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from basis_arb.backtest.engine import PNL_COLUMNS, TRADE_COLUMNS, fills_frame, prepare_panel, run_backtest
-from basis_arb.backtest.sensitivity import FULL_GRID, run_grid
+from basis_arb.backtest.engine import (
+    PNL_COLUMNS, RESIZE_THRESHOLD, TRADE_COLUMNS, fills_frame, prepare_panel, run_backtest,
+)
+from basis_arb.backtest.run import STRATEGY_NAMES
+from basis_arb.backtest.sensitivity import FULL_GRID, REPLICATION_STRATEGIES, run_grid
 from basis_arb.config import BacktestConfig, MarginModel, StrategyParams
 from basis_arb.model import signals
 from basis_arb.types import STRATEGIES
@@ -25,6 +29,7 @@ PRICE_COLUMNS = (
     "spot_close", "spot_high", "spot_low", "perp_close", "perp_high", "perp_low",
     "fut_cq_close", "fut_cq_high", "fut_cq_low", "fut_nq_close", "fut_nq_high", "fut_nq_low",
 )
+CROSS = MarginModel(mode="cross_collateral")
 
 
 def manual_targets(panel: pd.DataFrame, enter: int, exit_: int, direction: int = 1, contract=None) -> pd.DataFrame:
@@ -45,13 +50,18 @@ def manual_targets(panel: pd.DataFrame, enter: int, exit_: int, direction: int =
     )
 
 
-def rally_panel(mult: float = 1.6, start_day: int = 35, ramp_days: int = 5, n_days: int = 60) -> pd.DataFrame:
-    """Constant 0.03%/8h funding; every price rallies linearly by `mult` over `ramp_days` (dates untouched)."""
-    panel = make_panel(funding_per_period=0.0003, n_hours=24 * n_days)
+def scaled_panel(mult: float, at_bar: int, n_hours: int = 24 * 5, wick_only: bool = False) -> pd.DataFrame:
+    """Constant 0.03%/8h funding; every price is multiplied by `mult` from `at_bar` on (dates untouched).
+    With wick_only, only the highs (mult > 1) or lows (mult < 1) of that single bar move."""
+    panel = make_panel(funding_per_period=0.0003, n_hours=n_hours)
+    if wick_only:
+        col = "high" if mult > 1 else "low"
+        for leg in ("spot", "perp", "fut_cq", "fut_nq"):
+            c = f"{leg}_{col}"
+            panel.iloc[at_bar, panel.columns.get_loc(c)] = panel[f"{leg}_close"].iloc[at_bar] * mult
+        return panel
     m = np.ones(len(panel))
-    i0, i1 = 24 * start_day, 24 * (start_day + ramp_days)
-    m[i0:i1] = np.linspace(1.0, mult, i1 - i0)
-    m[i1:] = mult
+    m[at_bar:] = mult
     for col in PRICE_COLUMNS:
         panel[col] = panel[col] * m
     return panel
@@ -83,7 +93,7 @@ def test_cash_and_carry_pnl_basis_matches_basis_decay_and_costs_match_cost_model
     )
     assert tr.pnl_costs == pytest.approx(-expected, rel=1e-9)
     assert tr.cost_fees + tr.cost_slippage == pytest.approx(expected, rel=1e-9)
-    assert tr.pnl_funding == 0.0
+    assert tr.pnl_funding == 0.0 and tr.n_resizes == 0
     assert tr.pnl_total == pytest.approx(tr.pnl_basis + tr.pnl_costs)
     assert res.equity.iloc[-1] - res.capital == pytest.approx(tr.pnl_total)
     fills = fills_frame(res.fills)
@@ -174,42 +184,148 @@ def test_settlement_happens_even_if_the_target_still_holds_the_expired_contract(
     assert (res.position.iloc[exp_bar:] == 0).all()
 
 
-# --- 4. margin monitor ----------------------------------------------------------------------------
-def test_isolated_liquidation_closes_both_legs_and_charges_the_penalty():
-    panel = rally_panel()
+# --- 4. margin monitor (close prices) ----------------------------------------------------------------
+def test_isolated_liquidation_on_a_close_move_closes_both_legs_at_the_close():
+    jump = 24 * 2 + 3  # a non-stamp bar, after the manual entry
+    panel = scaled_panel(1.6, jump)
     cfg = BacktestConfig(margin=MarginModel(perp_leverage=2.0, mode="isolated"))
-    res = run_backtest(panel, "funding_carry", cfg)
+    res = run_backtest(panel, "funding_carry", cfg, targets=manual_targets(panel, 5, len(panel)))
     liq = res.events[res.events["event"] == "LIQUIDATION"]
-    assert len(liq) == 1 and liq["leg"].iloc[0] == "perp"
-    ts = liq["ts"].iloc[0]
+    assert len(liq) == 1 and liq["leg"].iloc[0] == "perp" and liq["ts"].iloc[0] == panel.index[jump]
     fills = fills_frame(res.fills)
-    at = fills[fills["ts"] == ts]
+    at = fills[fills["ts"] == panel.index[jump]]
     assert sorted(at["leg"]) == ["perp", "spot"] and (at["reason"] == "LIQUIDATION").all()
-    assert len(res.trades) == 1  # no re-entry while the target stays +1
+    close = panel["perp_close"].iloc[jump]
+    s = cfg.costs.slippage_bps / 1e4
+    assert at[at["leg"] == "perp"]["price"].iloc[0] == pytest.approx(close * (1 + s))  # at the bar's close
+    assert len(res.trades) == 1 and res.trades.iloc[0]["exit_reason"] == "LIQUIDATION"  # no re-entry
     tr = res.trades.iloc[0]
-    assert tr.exit_reason == "LIQUIDATION" and (res.position.loc[ts:] == 0).all()
-    entry = fills[(fills["leg"] == "perp") & (fills["reason"] == "ENTER")]["price"].iloc[0]
-    p_liq = entry * (1.0 + cfg.margin.liquidation_move("perp"))
-    penalty = tr.qty * p_liq * cfg.costs.liquidation_penalty_bps / 1e4
-    assert liq["price"].iloc[0] == pytest.approx(p_liq)
+    penalty = tr.qty * close * cfg.costs.liquidation_penalty_bps / 1e4
     assert res.pnl_components["liquidation"].sum() == pytest.approx(-penalty)
-    assert tr.cost_liquidation == pytest.approx(penalty)
-    hi = panel["perp_high"]
-    assert hi.loc[ts] > p_liq and (hi.loc[tr.entry_ts:ts].iloc[1:-1] <= p_liq).all()  # first breach
-    assert res.margin_stats["n_liquidations"] == 1
+    assert liq["price"].iloc[0] == pytest.approx(close)
+    assert (res.position.iloc[jump:] == 0).all()
 
 
-def test_cross_collateral_never_liquidates_and_reports_peak_utilization():
-    panel = rally_panel()
-    cfg = BacktestConfig(margin=MarginModel(perp_leverage=2.0, mode="cross_collateral"))
-    res = run_backtest(panel, "funding_carry", cfg)
+def test_intrabar_wick_never_liquidates_and_is_counted_as_a_diagnostic():
+    wick = 24 * 2 + 3
+    panel = scaled_panel(1.6, wick, wick_only=True)  # perp high +60% on one bar, close unchanged
+    res = run_backtest(panel, "funding_carry", BacktestConfig(), targets=manual_targets(panel, 5, len(panel)))
     assert not (res.events["event"] == "LIQUIDATION").any()
-    assert res.margin_stats["n_liquidations"] == 0 and res.margin_stats["peak_utilization"] > 1.0
-    entry = [f.price for f in res.fills if f.leg == "perp" and f.reason == "ENTER"][0]
-    peak_move = panel["perp_high"].max() / entry - 1.0
-    assert res.margin_stats["peak_adverse_move"] == pytest.approx(peak_move)
-    assert res.margin_stats["peak_utilization"] == pytest.approx(peak_move / cfg.margin.liquidation_move("perp"))
+    ms = res.margin_stats
+    assert ms["intrabar_breach_bars"] == 1 and ms["peak_intrabar_utilization"] > 1.0
+    assert ms["peak_utilization"] < 0.01  # closes never moved
     assert res.trades.iloc[0]["exit_reason"] == "OPEN"
+
+
+def test_cross_collateral_never_liquidates_reports_utilization_and_resizes_at_next_stamp():
+    jump = 24 * 2 + 3  # 03:00 -> next stamp 08:00
+    panel = scaled_panel(1.6, jump)
+    cfg = BacktestConfig(margin=CROSS)
+    res = run_backtest(panel, "funding_carry", cfg, targets=manual_targets(panel, 5, len(panel)))
+    assert not (res.events["event"] == "LIQUIDATION").any() and res.margin_stats["n_liquidations"] == 0
+    entry = [f.price for f in res.fills if f.leg == "perp" and f.reason == "ENTER"][0]
+    peak_move = panel["perp_close"].iloc[jump] / entry - 1.0
+    assert res.margin_stats["peak_utilization"] == pytest.approx(peak_move / cfg.margin.liquidation_move("perp"))
+    assert res.margin_stats["peak_utilization"] > 1.0
+    resize = res.events[res.events["event"] == "RESIZE"]
+    assert len(resize) == 1 and resize["ts"].iloc[0] == panel.index[jump + 5]
+
+
+def test_calendar_uses_futures_pair_mode():
+    panel = scaled_panel(1.6, 24 * 2 + 3)
+    tg = manual_targets(panel, 5, len(panel), direction=1, contract="SYN_CQ")
+    iso_pair = BacktestConfig(margin=MarginModel(mode="cross_collateral", futures_pair_mode="isolated"))
+    default = run_backtest(panel, "calendar", BacktestConfig(), targets=tg)  # spot-leg mode isolated, pair cross
+    assert default.margin_stats["mode"] == "cross_collateral" and default.margin_stats["n_liquidations"] == 0
+    iso = run_backtest(panel, "calendar", iso_pair, targets=tg)  # the short quarterly leg breaches on the close
+    assert iso.margin_stats["mode"] == "isolated" and iso.margin_stats["n_liquidations"] == 1
+    assert np.isfinite(default.margin_stats["peak_pair_utilization"])
+
+
+# --- resize rule --------------------------------------------------------------------------------------
+def test_two_x_price_move_triggers_one_resize_at_the_next_stamp():
+    jump = 24 * 2 + 3  # 03:00 on day 3; the next funding stamp is 08:00
+    panel = scaled_panel(2.0, jump)
+    cfg = BacktestConfig(margin=CROSS)
+    res = run_backtest(panel, "funding_carry", cfg, targets=manual_targets(panel, 5, len(panel)))
+    resize = res.events[res.events["event"] == "RESIZE"]
+    assert len(resize) == 1 and resize["ts"].iloc[0] == panel.index[jump + 5]
+    fills = fills_frame(res.fills)
+    rf = fills[fills["reason"] == "RESIZE"]
+    q0 = NOTIONAL / SPOT
+    assert sorted(rf["leg"]) == ["perp", "spot"] and rf["qty"].to_numpy() == pytest.approx([q0 / 2, q0 / 2])
+    assert dict(zip(rf["leg"], rf["side"])) == {"spot": "sell", "perp": "buy"}  # both legs back to 10k notional
+    s, c = cfg.costs.slippage_bps / 1e4, cfg.costs
+    px = 2 * SPOT
+    cost = (q0 / 2) * px * (1 - s) * c.spot_fee_bps / 1e4 + (q0 / 2) * px * (1 + s) * c.fut_fee_bps / 1e4 \
+        + 2 * (q0 / 2) * px * s
+    assert res.pnl_components["resize"].sum() == pytest.approx(-cost)
+    assert res.trades.iloc[0]["n_resizes"] == 1 and res.margin_stats["n_resizes"] == 1
+    final = {p.leg: p.qty for p in res.final_positions}
+    assert final["spot"] * px == pytest.approx(NOTIONAL) and final["perp"] == pytest.approx(-final["spot"])
+    prev = res.equity.shift(1).fillna(res.capital)
+    np.testing.assert_allclose(res.pnl_components.sum(axis=1), res.equity - prev, atol=1e-7)
+
+
+def test_small_moves_do_not_resize_and_a_halving_resizes_up():
+    small = scaled_panel(1.0 + RESIZE_THRESHOLD * 0.9, 24 * 2 + 3)
+    res = run_backtest(small, "funding_carry", BacktestConfig(), targets=manual_targets(small, 5, len(small)))
+    assert not (res.events["event"] == "RESIZE").any()
+    half = scaled_panel(0.5, 24 * 2 + 3)  # short perp gains: no margin issue in isolated mode
+    res = run_backtest(half, "funding_carry", BacktestConfig(), targets=manual_targets(half, 5, len(half)))
+    rf = fills_frame(res.fills).query("reason == 'RESIZE'")
+    assert dict(zip(rf["leg"], rf["side"])) == {"spot": "buy", "perp": "sell"}
+    assert res.margin_stats["n_liquidations"] == 0 and res.margin_stats["n_resizes"] == 1
+
+
+# --- capital and returns --------------------------------------------------------------------------------
+def test_capital_is_required_capital_and_target_when_flat():
+    panel = scaled_panel(1.2, 24 * 2 + 3)  # +20%: below the resize threshold, capital drifts with the spot value
+    cfg = BacktestConfig()
+    res = run_backtest(panel, "funding_carry", cfg, targets=manual_targets(panel, 5, 24 * 4))
+    target = NOTIONAL * (1 + 1 / cfg.margin.perp_leverage)
+    assert res.capital == pytest.approx(target)
+    cap = res.capital_t
+    assert cap.iloc[:5].eq(target).all() and cap.iloc[24 * 4:].eq(target).all()  # flat: target capital
+    q = NOTIONAL / SPOT
+    i = 24 * 3
+    expected = q * panel["spot_close"].iloc[i] + q * panel["perp_close"].iloc[i] / cfg.margin.perp_leverage
+    assert cap.iloc[i] == pytest.approx(expected)
+    prev_cap = cap.shift(1).fillna(res.capital)
+    np.testing.assert_allclose(res.returns_hourly * prev_cap, res.equity.diff().fillna(res.equity.iloc[0] - res.capital),
+                               atol=1e-7)
+    assert res.returns_hourly.notna().all() and (res.returns_hourly.iloc[24 * 4 + 1:] == 0).all()
+
+
+def test_capital_units_follow_the_spec():
+    panel = make_panel(n_hours=48)
+    lev2 = BacktestConfig()
+    lev3 = BacktestConfig(margin=MarginModel(perp_leverage=3.0, fut_leverage=3.0))
+    for s in ("cash_and_carry", "funding_carry", "random_maturity"):
+        assert run_backtest(panel, s, lev2).capital == pytest.approx(NOTIONAL * 1.5)
+        assert run_backtest(panel, s, lev3).capital == pytest.approx(NOTIONAL * (1 + 1 / 3))
+    assert run_backtest(panel, "calendar", lev2).capital == pytest.approx(NOTIONAL)
+    assert run_backtest(panel, "calendar", lev3).capital == pytest.approx(2 * NOTIONAL / 3)
+
+
+# --- fill lag -------------------------------------------------------------------------------------------
+def test_fill_lag_one_executes_one_bar_later():
+    panel = scaled_panel(1.0, 0)
+    ramp = np.linspace(1.0, 1.1, len(panel))
+    for col in PRICE_COLUMNS:
+        panel[col] = panel[col] * ramp
+    tg = manual_targets(panel, 5, 30)
+    lag0 = run_backtest(panel, "funding_carry", BacktestConfig(), targets=tg)
+    cfg1 = BacktestConfig(params=dataclasses.replace(StrategyParams(), fill_lag_bars=1))
+    lag1 = run_backtest(panel, "funding_carry", cfg1, targets=tg)
+    f0, f1 = fills_frame(lag0.fills), fills_frame(lag1.fills)
+    assert len(f0) == len(f1) == 4
+    assert (f1["ts"] - f0["ts"]).eq(pd.Timedelta(hours=1)).all()
+    s = BacktestConfig().costs.slippage_bps / 1e4
+    for _, r in f1.iterrows():
+        close = panel.loc[r["ts"], "spot_close" if r["leg"] == "spot" else "perp_close"]
+        assert r["price"] == pytest.approx(close * (1 + s if r["side"] == "buy" else 1 - s))
+    assert lag1.trades.iloc[0]["entry_ts"] == panel.index[6]
 
 
 # --- 6. no look-ahead / 7. determinism --------------------------------------------------------------
@@ -220,8 +336,9 @@ def _busy_panel(**kw) -> pd.DataFrame:
 
 
 @pytest.mark.parametrize("strategy", STRATEGIES)
-def test_no_look_ahead(strategy):
-    cfg = BacktestConfig()
+@pytest.mark.parametrize("lag", [0, 1])
+def test_no_look_ahead(strategy, lag):
+    cfg = BacktestConfig(params=dataclasses.replace(StrategyParams(), fill_lag_bars=lag))
     base = _busy_panel()
     t_cut = base.index[24 * 45]
     mod = base.copy()
@@ -257,21 +374,11 @@ def test_pnl_components_add_up_to_equity_changes(strategy):
     assert tuple(res.pnl_components.columns) == PNL_COLUMNS and tuple(res.trades.columns) == TRADE_COLUMNS
     prev = res.equity.shift(1).fillna(res.capital)
     np.testing.assert_allclose(res.pnl_components.sum(axis=1), res.equity - prev, atol=1e-7)
-    np.testing.assert_allclose(res.returns_hourly * res.capital, res.equity - prev, atol=1e-7)
+    prev_cap = res.capital_t.shift(1).fillna(res.capital)
+    np.testing.assert_allclose(res.returns_hourly * prev_cap, res.equity - prev, atol=1e-7)
     tr = res.trades
     assert tr["pnl_total"].sum() == pytest.approx(res.equity.iloc[-1] - res.capital, abs=1e-6)
     np.testing.assert_allclose(tr["pnl_total"], tr["pnl_basis"] + tr["pnl_funding"] + tr["pnl_costs"], atol=1e-9)
-
-
-def test_capital_units_follow_the_spec():
-    panel = make_panel(n_hours=48)
-    lev2 = BacktestConfig()
-    lev3 = BacktestConfig(margin=MarginModel(perp_leverage=3.0, fut_leverage=3.0))
-    for s in ("cash_and_carry", "funding_carry", "random_maturity"):
-        assert run_backtest(panel, s, lev2).capital == pytest.approx(NOTIONAL * 1.5)
-        assert run_backtest(panel, s, lev3).capital == pytest.approx(NOTIONAL * (1 + 1 / 3))
-    assert run_backtest(panel, "calendar", lev2).capital == pytest.approx(NOTIONAL)
-    assert run_backtest(panel, "calendar", lev3).capital == pytest.approx(2 * NOTIONAL / 3)
 
 
 def test_reverse_calendar_flips_both_legs_with_equal_coin_quantity():
@@ -317,6 +424,7 @@ def test_input_contract_violations_raise():
         run_backtest(panel, "funding_carry", BacktestConfig(margin=MarginModel(mode="portfolio")))
     with pytest.raises(ValueError, match="different panel"):
         run_backtest(panel, "funding_carry", cfg, prepared=prepare_panel(make_panel(n_hours=72)))
+    assert STRATEGY_NAMES == STRATEGIES
 
 
 # --- sensitivity grid -------------------------------------------------------------------------------
@@ -324,14 +432,19 @@ def test_small_grid_marks_base_cell_and_dedupe_matches_full_recompute():
     panel = _busy_panel(n_hours=24 * 75)
     fast = run_grid(panel, "SYN", BacktestConfig(), FULL_GRID, mode="small")
     slow = run_grid(panel, "SYN", BacktestConfig(), FULL_GRID, mode="small", dedupe=False)
-    assert fast.attrs["n_configs"] == 11 and len(fast) == 11 * len(STRATEGIES)
+    n_rep = 3 * len(REPLICATION_STRATEGIES)
+    assert fast.attrs["n_configs"] == 12 and len(fast) == 12 * len(STRATEGIES) + n_rep
+    assert fast.attrs["n_replication_cells"] == 3
+    assert set(fast[fast["kind"] == "replication"]["strategy"]) == set(REPLICATION_STRATEGIES)
     assert fast["is_base"].sum() == len(STRATEGIES)
-    assert fast.attrs["n_unique_runs"] < slow.attrs["n_unique_runs"] == 11 * len(STRATEGIES)
+    assert fast.attrs["n_unique_runs"] < slow.attrs["n_unique_runs"] == len(fast)
     pd.testing.assert_frame_equal(fast, slow)
     base = fast[fast["is_base"]].set_index("strategy")
     for s in STRATEGIES:
         direct = run_backtest(panel, s, BacktestConfig())
         assert base.loc[s, "pnl_total"] == pytest.approx(direct.equity.iloc[-1] - direct.capital, abs=1e-9)
+    lag = fast[(fast["kind"] == "grid") & (fast["fill_lag"] == 1)]
+    assert len(lag) == len(STRATEGIES)
 
 
 # --- 8. CLI -----------------------------------------------------------------------------------------
@@ -354,10 +467,13 @@ def test_cli_smoke_writes_report_and_figures(tmp_path):
     for png in ("equity_curves.png", "drawdown.png", "theory_vs_market.png"):
         assert (out / png).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "N_configs = 11" in md and "## Assumptions" in md and "Stress episodes" in md
+    assert "N_configs = 12" in md and "## Assumptions" in md and "Stress episodes" in md
+    assert "Excess Sharpe" in md and "Funding diagnostics" in md and "HMRW-low" in md
     assert b"\r\n" not in (out / "summary.md").read_bytes()
     payload = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
-    assert set(payload["strategies"]) == set(STRATEGIES) and payload["n_configs"] == 11
+    assert set(payload["strategies"]) == set(STRATEGIES) and payload["n_configs"] == 12
+    s1 = payload["strategies"]["cash_and_carry"]["summary"]
+    assert {"ann_excess_return", "excess_sharpe", "ann_return_raw", "sharpe_raw", "n_resizes"} <= set(s1)
 
 
 def test_cli_missing_panel_exits_nonzero(tmp_path):
