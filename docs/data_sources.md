@@ -58,6 +58,8 @@ Contract specifications used by the model (Binance support articles, read 2026-1
 
 ## Build log (2026-10-18)
 
+**Rules after review (2026-10-18; both panels rebuilt from the cache with `--end "2026-10-17 20:00"`):** (1) DTB3 for date d applies from (d + 1 day) 00:00 UTC, never from d itself (next-business-day publication), so `r_usd` is exactly the earlier series shifted by 24h (range unchanged); (2) `max_ffill_hours` defaults to 5, so the plain command builds both panels: gaps above 5h still raise, every filled spot/perp row is logged at INFO, and filled rows keep NaN high/low, which the model treats as exchange-outage rows with no decision. Apart from `r_usd`, the only change in the rebuilt panels is ETH `y_coin`, now 0.00 per the current `config.RateInputs`.
+
 Command: `python -m basis_arb.data.panel --root {BTCUSDT,ETHUSDT} --start 2020-01-01 --max-ffill-hours 5`,
 run 2026-10-17 ~20:15 UTC (2026-10-18 KST). Output `data/panel_{ROOT}_1h.parquet` (4.6 / 4.2 MB), raw
 cache `data/raw/` (23 MB, 56 files). Each build takes ~25 s cold (about 180 REST calls), ~3 s from the
