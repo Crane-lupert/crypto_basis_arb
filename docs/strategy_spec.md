@@ -1,8 +1,9 @@
 # Strategy specification (pre-registered)
 
-Status: v1.0, frozen 2026-10-18 before the first full-sample backtest. Any change to a threshold,
-cost assumption, or rule after this date requires a dated entry in `docs/research_log.md` and a
-re-run that reports both the old and the new configuration.
+Status: **v1.0.2**, frozen 2026-10-18 after the engineering review and before the first *cited*
+full-sample backtest (a superseded v1.0 run exists in `reports/` and is not quoted). Changes from v1.0
+are itemized in `docs/research_log.md` (entry "spec v1.0.2"). Any later change to a threshold, cost
+assumption, or rule requires a dated research-log entry and a re-run that reports both configurations.
 
 This document is the contract between `data/`, `model/`, `backtest/` and `live/`. Code that
 disagrees with it is wrong; the document is not silently updated to match code.
@@ -12,7 +13,7 @@ disagrees with it is wrong; the document is not silently updated to match code.
 | Item | Choice | Why |
 |---|---|---|
 | Venue | Binance only (spot, USDⓈ-M perpetual, USDⓈ-M quarterly delivery) | one account, one margin pool, no cross-venue transfer risk; the theory papers use Binance data |
-| Underlyings | BTC, ETH | deepest books; ETH adds a non-zero coin yield (staking) to the fair-value model |
+| Underlyings | BTC, ETH | deepest books; both held as unstaked spot (ETH staking yield is a diagnostic only) |
 | Research grid | 1 hour, UTC | funding stamps (00/08/16 UTC) and expiries (08:00 UTC) fall on the grid |
 | Sample | 2020-01-01 to the fetch date | perpetual funding history starts 2019-09; quarterlies start 2021-03 |
 | Capital unit | 10,000 USDT notional per leg, equal coin quantity on both legs | delta-neutral in coin units |
@@ -30,8 +31,8 @@ grid with index `ts` (tz-aware UTC). Required columns (see `basis_arb.types.PANE
 | `funding_rate` | funding rate settled **at** `ts`; NaN on non-stamp rows. Source `/fapi/v1/fundingRate` (actual stamps, so 4h/1h regimes are honored) |
 | `fut_cq_*` | current-quarter contract: `symbol` (`BTCUSDT_YYMMDD`), `close/high/low`, `expiry` (08:00 UTC last Friday), `dte_days` = (expiry - ts)/1d |
 | `fut_nq_*` | next-quarter contract, same fields |
-| `r_usd` | FRED `DTB3`/100, forward-filled (observation date `d` applies from `d` 00:00 UTC onward; no look-ahead) |
-| `y_coin` | coin yield r′: BTC 0.00, ETH 0.03 (constant staking proxy, documented in `docs/theory.md`) |
+| `r_usd` | FRED `DTB3`/100, forward-filled; the observation for date `d` applies from `d + 1` 00:00 UTC onward (publication lag) |
+| `y_coin` | yield actually earned on the spot leg: 0.00 for BTC and ETH (v1 holds unstaked spot). The ETH staking proxy (0.03) is a diagnostic in `docs/theory.md`, never a decision input |
 
 Contract selection: at `ts`, `cq` is the listed quarterly with the nearest `expiry > ts`; `nq` the one
 after it. A contract whose `expiry <= ts` leaves the panel at that bar. Rows where a contract did not
@@ -63,13 +64,13 @@ Notation: `S` spot, `P` perpetual, `F` quarterly, `τ` years to expiry, `r` USD 
 | Fair perpetual price | `P* = κ/(κ − (r − r′))·S` | He-Manela-Ross-von Wachter Prop. 1 |
 | Fair funding per period | `(P* − S)/S = (r − r′)/(κ − (r − r′)) ≈ (r − r′)/κ` | same |
 | Annualized fair funding | `f* = κ·(r − r′)/(κ − (r − r′)) ≈ r − r′` | same |
-| Trailing funding | `f̂ = mean over the trailing 30-day calendar window of per-print annualized funding`, each print annualized by its own interval (`rate × 8760 / interval_hours`, so 8h, 4h and 1h regimes are comparable); NaN until a full 30-day window exists, and NaN again if the funding feed stalls for more than one interval | 90 prints at 8h |
+| Trailing funding | `f̂ = (Σ funding prints in (t − 30d, t]) × 365 / 30` — a time-weighted sum, so 8h, 4h and 1h regimes mix correctly; NaN until a full 30-day window exists, and NaN again if the funding feed stalls for more than one interval | 90 prints at 8h |
 | **Excess funding** | `e_fund = f̂ − f*` | — |
 | Annualized perp premium | `ρ = κ·ln(P/S)` | HMRW |
 | Fair premium | `ρ* = κ·ln(κ/(κ − (r − r′))) ≈ r − r′` | HMRW |
 | **Premium deviation** | `e_rm = ρ − ρ*` | HMRW |
 | No-arbitrage band | `[κ·ln(1 − C), κ·ln(1 + C)]`, `C` = round-trip cost fraction | HMRW Prop. 2 |
-| **Calendar excess** | `e_cal = b − f̂` | both are the cost of a synthetic long (AHJ random-maturity representation) |
+| **Calendar excess** | `e_cal = b_P − f̂`, with `b_P = ln(F/P)/τ` the quarterly-vs-perpetual spread actually traded | static replication: holding the quarterly costs the basis, holding the perpetual costs the funding stream; with trailing realized funding as the forecast this is a funding-forecast / term-premium trade, not a pure mispricing |
 
 ## 4. Costs and hurdles
 
@@ -87,8 +88,13 @@ Hurdle (annualized) = `C × 365 / H + buffer`, where `H` is the expected holding
 * S1/S3: `H = days to expiry` of the contract considered (the hurdle rises mechanically as expiry nears).
 * S2: `H = 30` days (fixed, matches the trailing-funding lookback).
 * S4: the hurdle is HMRW's band edge `κ·ln(1 + C)` (a one-off cost expressed in annualized-premium units); no buffer.
+  At VIP0 taker costs this is 4.15 in annualized-premium units, i.e. a 38 bp perpetual premium at an hourly
+  close, about 2.3× HMRW's widest tested band, so S4 is expected to be nearly inactive at VIP0; the HMRW fee
+  levels are run as replication cells (§8).
 
 Delivery fee 5 bp on a quarterly carried into settlement. Liquidation penalty 50 bp (isolated mode only).
+Cost tiers for the grid: VIP0 (10 / 5 / 2 bp), VIP0 with BNB discount (spot −25%, futures −10%: 7.5 / 4.5 / 2),
+VIP3 (6 / 3.2 / 2); HMRW replication (2.25 / 0.18, 4.5 / 0.72, 6.75 / 1.44 bp, no slippage).
 
 ## 5. Strategies (model/signals.py)
 
@@ -129,49 +135,65 @@ Event loop over the 1h panel, one strategy at a time, equal coin quantity on bot
 3. **Funding**: at a funding stamp, perp positions held *before* this bar's trades receive
    `−qty × funding_rate × perp_close` (a short with positive funding receives cash). Positions opened at
    the stamp bar do not receive that stamp's funding.
-4. **Margin monitor** (futures legs): track the worst adverse close/high/low move since entry. Isolated
-   mode: if it exceeds `1/leverage − maintenance` the leg is liquidated at that bar, the other leg is
-   closed, the penalty is charged, and the event is logged. Cross-collateral mode: no liquidation; the
-   peak utilization is reported.
-5. **Trade**: if `target` or `contract` changed, close/open legs at `close ± slippage` and pay fees.
+4. **Margin monitor** (futures legs): track the worst adverse **close** move since entry (Binance liquidates
+   on mark price; last-trade wicks on thin quarterlies are not mark prices, so the intrabar high/low worst case
+   is reported as a diagnostic only). Spot-leg strategies (S1, S2, S4) use isolated mode: if the adverse move
+   exceeds `1/leverage − maintenance` the leg is liquidated at that bar's close, the other leg is closed, the
+   penalty is charged, and the event is logged. S3's two futures legs share one USDⓈ-M wallet
+   (`futures_pair_mode = cross_collateral`): no per-leg liquidation; peak utilization is reported.
+5. **Trade**: if `target` or `contract` changed, close/open legs at `close ± slippage` and pay fees, at the
+   decision bar (`fill_lag_bars = 0`, pre-registered) or the next bar (`fill_lag_bars = 1`, sensitivity axis).
    A roll closes the old contract and opens the new one on the same bar; the spot leg is untouched.
-6. **Capital** for return computation: spot-leg strategies `notional × (1 + 1/leverage)`; futures-only
-   (S3) `2 × notional / leverage`. Idle cash earns nothing (conservative; `r` is already inside the
-   fair-value hurdle).
+6. **Resize**: at a funding stamp, if the pair's notional deviates from the target by more than 25%, both legs
+   are resized to the target notional (fees charged, event logged), so exposure never drifts far from capital.
+7. **Capital** for return computation is the capital actually required by the open position, re-measured each
+   bar: spot-leg strategies `spot value + futures margin at target leverage`; futures-only (S3)
+   `2 × notional / leverage`. Idle cash earns nothing in the raw figures; the headline figures are excess of
+   the T-bill (§7).
 
 P&L decomposition per strategy: basis convergence (mark-to-market of the two legs), funding received or
-paid, fees + slippage, delivery fees, liquidation penalties.
+paid, fees + slippage, delivery fees, liquidation penalties, resize costs.
 
 ## 7. Metrics (backtest/metrics.py)
 
-* Daily aggregation of P&L (UTC days), Sharpe = mean/std × √365 (24/7 market), reported net of all costs.
-* Annualized return on capital, max drawdown (on equity), hit rate per round trip, average holding time,
-  number of round trips, turnover, time-in-position, worst 30-day window.
+* Daily aggregation of P&L (UTC days). **Headline figures are excess of the risk-free rate**: daily excess
+  P&L = P&L − (r_t/365) × capital, Sharpe = mean/std × √365 (24/7 market) on the excess series, net of all
+  costs. Raw (non-excess) figures are reported second, never as the headline.
+* Annualized excess return on capital, max drawdown (on equity), hit rate per round trip, average holding time,
+  number of round trips, turnover, time-in-position, worst 30-day window, liquidation and resize counts,
+  peak margin utilization, intrabar worst-case diagnostic, share of funding prints exactly equal to 0.01% by year.
 * Year-by-year table and the five stress episodes named in the research log (Mar-2020, May-2021,
   Nov-2022 FTX, Aug-2024, Q1/Q2-2026 funding compression).
 * "Theory vs market" diagnostics: time series of `b` vs `b*`, `f̂` vs `f*`, `ρ` vs `ρ*`, with the band.
 
 ## 8. Sensitivity grid (the only sanctioned variation)
 
-`buffer ∈ {0, 3, 6, 10}%/yr`, `lookback ∈ {30, 90, 180}` prints, `leverage ∈ {1, 2, 3}`,
-`hold_to_expiry ∈ {False, True}`, costs ∈ {VIP0, VIP0 with 25% BNB discount, VIP3}. The full grid is
-reported; the pre-registered cell is marked. `N_configs` is recorded in the report so a reader can
-discount the best cell.
+`buffer ∈ {0, 3, 6, 10}%/yr`, `lookback ∈ {30, 90, 180}` prints (as calendar windows of 10, 30, 60 days),
+`leverage ∈ {1, 2, 3}`, `hold_to_expiry ∈ {False, True}`, `fill_lag_bars ∈ {0, 1}`, costs ∈ {VIP0, VIP0 with
+BNB discount, VIP3}, plus the S4 HMRW replication cells (three fee levels, no slippage). The `small` grid
+varies one axis at a time around the pre-registered cell; the full grid is reported when run. The
+pre-registered cell is marked and `N_configs` is recorded in the report so a reader can discount the best cell.
 
 ## 9. Paper-live daemon (live/)
 
 * Poll interval 60 s; sources: spot `bookTicker`, perp `bookTicker` + `premiumIndex` (mark, index,
   last funding, next funding time), quarterly `bookTicker`, funding history refreshed hourly.
-* Signal path is **the same functions** as the backtest (`model/signals.py`) applied to a live row
-  appended to the cached panel: research/live parity by construction.
+* Signal path is **the same functions** as the backtest (`model/signals.py`). Decisions are taken only on
+  **closed 1h bars**: the current hour is one provisional row that is replaced on every poll and excluded from
+  the decision input, so bar counters (min hold, funding window) mean hours exactly as in the backtest;
+  research/live parity by construction, checked by a replay test on recorded bars.
 * Paper broker: fills at bid/ask ± slippage; funding accrual when a stamp is crossed, using the actual
   settled rate from `/fapi/v1/fundingRate`; state in `state/{ROOT}/book.json`, append-only ledger
   `state/{ROOT}/events.jsonl`, heartbeat line every loop.
 * Testnet broker: HMAC-signed REST to `testnet.binancefuture.com` (futures) and `testnet.binance.vision`
   (spot). The mainnet trading hosts do not appear anywhere in `live/broker.py`; a test asserts this.
-* Kill switches (fail-secure, block on uncertainty): quote age > 5 min → no new entries; > 30 min →
-  flatten (paper) and HALT; any exception in the decision path → SAFE mode (no new entries) until
-  restart; equity drawdown > 5% → flatten and HALT; exchange `maintenance`/non-200 → SAFE.
+  Quarterlies are not listed on the testnet, so S1/S3 are unsupported there; testnet fills are kept in a
+  ledger separate from paper P&L.
+* Kill switches (fail-secure, block on uncertainty; never trade blind): quote age > 5 min → SAFE (no new
+  entries, exits allowed); > 30 min → HALT **without** flattening (a hedge is not unwound on stale prices);
+  any exception in the decision path → SAFE until restart; equity drawdown > 5% → SAFE, flatten only on a
+  margin-utilization breach; exchange `maintenance`/non-200 → SAFE. HALT and SAFE events are logged and are
+  the operator's cue.
 * Nothing in this repository can be pointed at a real-money endpoint; promotion to real capital is a
   separate, deliberate decision outside this codebase.
 
@@ -179,5 +201,10 @@ discount the best cell.
 
 * Backtests are presented as backtests; paper-live results as paper; testnet fills as testnet.
 * Every number in `README.md` links to the report that produced it and the commit hash.
-* Known weaknesses are listed, not buried: single-venue, taker-only costs, hourly settlement proxy, no
-  exchange-risk model (FTX-type), constant ETH yield, isolated-margin liquidation proxy.
+* Known weaknesses are listed, not buried: single-venue, taker-only costs, hourly close-based fills and
+  settlement proxy, no exchange-risk model (FTX-type), unstaked ETH, close-based liquidation proxy, T-bill as
+  the stablecoin financing rate.
+* How this was built: the author directed an AI coding agent (Claude Code); every commit carries the
+  co-author trailer. The author set the scope, checked the theory mapping against the papers, commissioned
+  two independent reviews (code-level and engineering-level) and applied their findings before the cited run.
+  The spec and the tests are the contract.

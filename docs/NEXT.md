@@ -1,9 +1,23 @@
 # NEXT — resume checklist (written 2026-10-18 late night, before a usage-limit cutoff)
 
-State at the last checkpoint commit ("WIP checkpoint"): contract layer + data layer complete and tested;
-backtest engine and live daemon were being written by two agents and may be partial on disk; an
-engineering review produced fixes, some applied, some pending (list below). Real panels exist in
-`data/panel_BTCUSDT_1h.parquet` and `data/panel_ETHUSDT_1h.parquet` (gitignored; rebuild with the CLI).
+State at the last checkpoint commits: contract layer, data layer, **backtest engine** and **live daemon** are
+all complete on disk and tested (offline suite 166 passed). An engineering review produced fixes, some
+applied, some pending (list below). Real panels exist in `data/panel_BTCUSDT_1h.parquet` and
+`data/panel_ETHUSDT_1h.parquet` (gitignored; rebuild with the CLI). `reports/{BTCUSDT,ETHUSDT}/` hold a
+first real-data run made with the model code *before* the latest fixes: superseded, do not cite.
+
+Agent-reported findings that need a dated spec decision (record in research_log before re-running):
+- Liquidation monitor: a single wick (BTCUSDT_210625 low 35,000 on 2021-04-18 04:00, -44% vs ~50k spot)
+  liquidated S3's long quarterly; Binance liquidates on mark price. Decision proposed: monitor on **close**
+  prices (mark-price klines would be the faithful source; thin-quarterly wicks are not mark prices) and report
+  the intrabar worst case as a diagnostic only.
+- Notional drift: coin quantity is fixed, so after a 10x price move the pair's notional is 10x the initial
+  capital (funding income scales with it; cross mode showed utilization 51). Decision proposed: resize both
+  legs back to target notional at a funding stamp when |notional/target - 1| > 25% (fees charged), and compute
+  returns on the capital actually required (spot value + futures margin at target leverage).
+- Cost tier: Binance's BNB discount is 25% on spot but 10% on USDⓈ-M futures (4.5 bp, not 3.75 bp).
+- Live daemon still follows the old rules for three items (closed-bar decision input, HALT-without-flatten on
+  stale quotes, drawdown -> SAFE, separate testnet ledger); see section 1.3.
 
 ## 0. First commands in a new session
 

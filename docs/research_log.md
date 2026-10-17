@@ -35,5 +35,50 @@ the spec updated in the same commit (`31d7787`), still before the data layer or 
   `dte_days` that disagree with `expiry − ts`.
 * Synthetic panel fixture now promotes the next quarter to current at expiry, like the real builder.
 
-Next entries: panel build stats, first full-sample results (pre-registered cell), sensitivity grid,
-paper-live start date.
+## 2026-10-18 — panel build, engineering review, spec v1.0.2 (still before the cited run)
+
+Panels: `BTCUSDT` and `ETHUSDT`, 59,565 hourly rows each (2020-01-01 00:00 → 2026-10-17 20:00 UTC),
+7,446 funding prints each (all 8h in this sample), 25 quarterlies each (`_210326` … `_270326`, data from
+2021-02-03/04), median annualized current-quarter basis 5.66% (BTC) / 5.13% (ETH), maximum with ≥ 7 days
+to expiry 80.6% / 95.7% (2021). Three Binance-wide spot gaps (2020-02-19 5h, 2020-12-21 4h, 2021-08-13 4h)
+are forward-filled (close only, high/low NaN).
+
+A first engine run on the pre-review model (`reports/`, superseded) produced the findings below. A second,
+independent engineering review of spec + model + docs returned one blocker and five high findings. All
+decisions taken before the cited run, as spec **v1.0.2**:
+
+1. **Phantom expiry/roll on data holes** (blocker): the held quarterly is keyed to the expiry recorded at
+   entry; expiry only when `ts ≥` that expiry; a missing symbol/price/dte on a later bar is a HOLD.
+2. **Trailing funding** is the sum of prints over the trailing 30-day calendar window × 365/30 (time-weighted),
+   not a mean of per-print annualized rates; full window required; a stalled feed yields NaN.
+3. **Headline metrics are excess of the T-bill**: daily excess P&L = P&L − (r_t/365) × capital; raw figures
+   are reported second.
+4. **ETH spot is unstaked**: `y = 0` in decisions and P&L for both coins; the 3% ETH staking proxy is a
+   diagnostic column only (it had been in the signal but never in the P&L).
+5. **Binance's 0.01% component is a contract term**, fixed whenever the average premium is inside the clamp
+   band; the equilibrium funding `(r − r′)/κ` is the benchmark it is compared with. S2 earns a rent that is
+   treated as a risk premium. Reworded in `fair_value.py`, `theory.md`, the interview notes.
+6. **Liquidation monitor on close prices**: the first run liquidated S3's long quarterly on a single wick
+   (`BTCUSDT_210625` low 35,000 on 2021-04-18 04:00, −44% versus ~50k spot). Binance liquidates on mark price,
+   and thin-quarterly wicks are not mark prices. The intrabar worst case is reported as a diagnostic only.
+7. **Notional resize rule**: coin quantity was fixed, so after a large price move the pair's notional and its
+   funding income scaled far beyond the initial capital (cross-mode utilization reached 51×). Both legs are
+   resized to the target notional at a funding stamp when |notional/target − 1| > 25% (fees charged), and
+   returns are computed on the capital actually required (spot value + futures margin at target leverage).
+8. **S3 margin**: both legs sit in one USDⓈ-M wallet → `futures_pair_mode = cross_collateral` (no per-leg
+   liquidation; utilization tracked). Spot-leg strategies stay isolated by default.
+9. **Fill timing**: `fill_lag_bars ∈ {0, 1}` becomes a sensitivity axis (0 pre-registered).
+10. **S4 replication cells**: HMRW's fee levels (2.25/0.18, 4.5/0.72, 6.75/1.44 bp spot/futures, no slippage)
+    are run as labelled replication cells; at VIP0 taker costs S4 is expected to be nearly inactive.
+11. **Cost tiers**: the BNB discount is 25% on spot but 10% on USDⓈ-M futures (7.5 / 4.5 bp).
+12. **Rate timing**: the DTB3 observation for date `d` applies from `d + 1` 00:00 UTC (publication lag;
+    Friday values effectively from Monday — a residual same-day look-ahead of a few hours remains, immaterial
+    for a rate that moves by basis points).
+13. **Outage rows carry no decision** (`stale_bar`), see the spec §2.
+14. **Calendar excess uses the quarterly-vs-perpetual spread** `ln(F/P)/τ` (the spread actually traded)
+    minus the trailing funding forecast, and is described as a funding-forecast / term-premium trade.
+15. **Live daemon** decides only on closed 1h bars; stale quotes > 30 min → HALT without flattening (never trade
+    blind); drawdown > 5% → SAFE, flatten only on a margin-utilization breach; testnet fills in a separate
+    ledger; quarterlies are unsupported on the testnet.
+
+Next entries: v1.0.2 results (pre-registered cell + grid), paper-live start date.
