@@ -12,9 +12,10 @@ Perpetual futures: He, Manela, Ross & von Wachter, "Fundamentals of Perpetual Fu
     With a constant stablecoin short rate r and underlying rate r' (kappa > r - r'):
         Prop. 1 (frictionless):      F_t = kappa / (kappa - (r - r')) * S_t
         Prop. 2 (round-trip cost C): |F_t - kappa/(kappa - (r - r')) * S_t| <= C,
-    with annualized bounds rho_l = kappa*ln(1 - C), rho_u = kappa*ln(1 + C) on the annualized premium
-    rho = kappa*ln(F/S). Their "random-maturity arbitrage" opens when rho leaves the band and closes
-    when rho first returns to zero.
+    with annualized bounds rho_l = kappa*ln(1 - C), rho_u = kappa*ln(1 + C) on the deviation rho - rho*
+    of the annualized premium rho = kappa*ln(F/S) from its fair value rho* = kappa*ln(kappa/(kappa-(r-r'))).
+    Their "random-maturity arbitrage" opens when the deviation leaves the band and closes when it first
+    returns to zero.
 
     Ackerer, Hugonnier & Jermann, "Perpetual Futures Pricing" (arXiv:2310.11771; Mathematical Finance):
     the perpetual price is the risk-neutral expected spot price at a random (exponential, rate kappa)
@@ -38,8 +39,12 @@ from basis_arb.config import (
     BINANCE_FUNDING_DAMPER,
     BINANCE_INTEREST_PER_PERIOD,
     DAYS_PER_YEAR,
+    FUNDING_INTERVAL_HOURS,
+    HOURS_PER_YEAR,
     KAPPA,
 )
+
+VALID_FUNDING_INTERVALS_H = (1.0, 2.0, 4.0, 8.0)
 
 
 def _ret(x):
@@ -58,11 +63,14 @@ def cost_of_carry_price(spot, r, y, tau_years):
 
 
 def annualized_basis(fut, spot, tau_years):
-    """Continuously-compounded annualized basis ln(F/S)/tau; NaN where tau <= 0."""
+    """Continuously-compounded annualized basis ln(F/S)/tau; NaN where tau <= 0 or a price is not positive."""
     tau = np.asarray(tau_years, float)
+    f = np.asarray(fut, float)
+    s = np.asarray(spot, float)
+    ok = (tau > 0) & (f > 0) & (s > 0)
     with np.errstate(divide="ignore", invalid="ignore"):
-        out = np.log(np.asarray(fut, float) / np.asarray(spot, float)) / tau
-    return _ret(np.where(tau > 0, out, np.nan))
+        out = np.log(f / s) / tau
+    return _ret(np.where(ok, out, np.nan))
 
 
 def fair_basis_ann(r, y=0.0):
@@ -87,6 +95,8 @@ def perp_fair_price(spot, r, r_prime=0.0, kappa: float = KAPPA):
 def fair_perp_premium_ann(r, r_prime=0.0, kappa: float = KAPPA):
     """Annualized fair log-premium rho* = kappa*ln(F*/S) = kappa*ln(kappa/(kappa - (r - r'))) ~ r - r'."""
     spread = np.asarray(r, float) - np.asarray(r_prime, float)
+    if np.any(kappa <= spread):
+        raise ValueError("fair_perp_premium_ann requires kappa > r - r'")
     return _ret(kappa * np.log(kappa / (kappa - spread)))
 
 
@@ -152,14 +162,48 @@ def binance_funding_rate(
 
 # --- trailing / amortization helpers ----------------------------------------------------------
 def trailing_funding_ann(funding_at_stamps: pd.Series, lookback_prints: int, kappa: float = KAPPA) -> pd.Series:
-    """Trailing mean of the last `lookback_prints` funding prints, annualized by kappa.
+    """Trailing mean of the last `lookback_prints` funding prints, annualized by kappa (8h cadence assumed).
 
-    Input must be indexed at funding stamps only (no NaN rows); the value at stamp t uses prints <= t.
+    Input must be indexed at funding stamps only (no NaN rows); the value at stamp t uses prints <= t and is
+    NaN until a full window of prints exists.
     """
     if lookback_prints < 1:
         raise ValueError("lookback_prints must be >= 1")
-    min_periods = max(1, lookback_prints // 3)
-    return funding_at_stamps.rolling(lookback_prints, min_periods=min_periods).mean() * kappa
+    return funding_at_stamps.rolling(lookback_prints, min_periods=lookback_prints).mean() * kappa
+
+
+def annualize_funding_prints(
+    funding_at_stamps: pd.Series, default_interval_hours: float = FUNDING_INTERVAL_HOURS
+) -> pd.Series:
+    """Per-print annualized funding using the actual interval between consecutive stamps.
+
+    Binance settles every 8h by default but moves a contract to 1h after a capped print and back to 4h
+    after calm prints, so a print's annualized rate is rate x (hours per year / interval hours). The first
+    print and any irregular gap (feed outage) use the default cadence.
+    """
+    s = funding_at_stamps.astype(float)
+    if s.empty:
+        return s
+    hours = s.index.to_series().diff().dt.total_seconds().div(3600.0)
+    hours = hours.where(hours.isin(VALID_FUNDING_INTERVALS_H), float(default_interval_hours))
+    hours.iloc[0] = float(default_interval_hours)
+    return s * (HOURS_PER_YEAR / hours.to_numpy(float))
+
+
+def trailing_funding_ann_window(funding_at_stamps: pd.Series, window_days: float) -> pd.Series:
+    """Calendar-window trailing mean of per-print annualized funding; NaN until a full window of history exists.
+
+    The window is `[t - window_days, t]`, so 30 days cover 90 prints at 8h, 180 at 4h, 720 at 1h.
+    """
+    if window_days <= 0:
+        raise ValueError("window_days must be positive")
+    ann = annualize_funding_prints(funding_at_stamps)
+    if ann.empty:
+        return ann
+    window = pd.Timedelta(hours=float(window_days) * 24.0)
+    out = ann.rolling(window, min_periods=1).mean()
+    full = ann.index >= ann.index[0] + window
+    return out.where(full)
 
 
 def amortized_cost_ann(round_trip_cost_frac, horizon_days):

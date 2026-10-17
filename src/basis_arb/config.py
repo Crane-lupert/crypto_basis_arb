@@ -89,7 +89,8 @@ class StrategyParams:
     cc_roll_days: float = 2.0  # roll/close when days-to-expiry < 2 (unless hold_to_expiry)
     cc_hold_to_expiry: bool = False
     # S2 funding carry: long spot / short perpetual
-    fc_lookback_prints: int = 90  # 90 funding prints = 30 days at 8h
+    fc_lookback_prints: int = 90  # lookback in 8h-print units (90 = 30 days); applied as a calendar window of
+    # prints x 8h so that 4h / 1h funding regimes are covered by the same 30 days of history
     fc_entry_buffer_ann: float = 0.03
     fc_exit_excess_ann: float = 0.0
     fc_expected_hold_days: float = 30.0  # amortization horizon for the entry hurdle
@@ -97,12 +98,14 @@ class StrategyParams:
     cal_entry_buffer_ann: float = 0.03
     cal_exit_excess_ann: float = 0.0
     cal_roll_days: float = 2.0
+    cal_hold_to_expiry: bool = False
     cal_allow_reverse: bool = True
     # S4 random-maturity arbitrage (He-Manela-Ross-von Wachter): spot vs perpetual premium band
     rm_exit_dev_ann: float = 0.0  # close when the annualized deviation first returns to zero
     # common
-    min_hold_bars: int = 8  # 8 x 1h: never flip inside one funding interval
-    allow_reverse: bool = False  # reverse cash-and-carry needs spot borrow: off by default
+    min_hold_bars: int = 8  # 8 x 1h: never flip inside one funding interval; counted from entry (rolls do not reset it)
+    allow_reverse: bool = False  # reserved: reverse spot-leg trades need a borrow-cost model that v1 does not have,
+    # so S1 / S2 / S4 ignore this flag (hard-coded off). S3 uses cal_allow_reverse.
 
 
 @dataclass(frozen=True)

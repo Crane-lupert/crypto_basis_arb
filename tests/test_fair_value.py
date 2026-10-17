@@ -87,12 +87,44 @@ def test_amortized_cost_and_round_trip():
     assert fv.amortized_cost_ann(rt, 0.0) > 1e6  # degenerate horizon never yields a tiny hurdle
 
 
-def test_trailing_funding_uses_only_past_prints():
+def test_trailing_funding_uses_only_past_prints_and_needs_a_full_window():
     idx = pd.date_range("2025-01-01", periods=6, freq="8h", tz="UTC")
     s = pd.Series([0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006], index=idx)
     out = fv.trailing_funding_ann(s, lookback_prints=3)
     assert out.iloc[-1] == pytest.approx(np.mean([0.0004, 0.0005, 0.0006]) * KAPPA)
-    assert out.iloc[0] == pytest.approx(0.0001 * KAPPA)  # min_periods = 1 for a 3-print window
+    assert out.iloc[:2].isna().all() and out.iloc[2] == pytest.approx(np.mean([0.0001, 0.0002, 0.0003]) * KAPPA)
+
+
+def test_annualize_funding_prints_uses_actual_interval():
+    idx8 = pd.date_range("2025-01-01", periods=3, freq="8h", tz="UTC")
+    assert np.allclose(fv.annualize_funding_prints(pd.Series(0.0003, index=idx8)).to_numpy(), 0.0003 * KAPPA)
+    idx4 = pd.date_range("2025-01-01", periods=3, freq="4h", tz="UTC")
+    out4 = fv.annualize_funding_prints(pd.Series(0.00015, index=idx4))
+    assert out4.iloc[1:].to_numpy() == pytest.approx(0.00015 * 2 * KAPPA)
+    # an irregular 16h gap (outage) falls back to the default cadence instead of halving the rate
+    gap = pd.DatetimeIndex(list(idx8[:2]) + [idx8[1] + pd.Timedelta(hours=16)])
+    out_gap = fv.annualize_funding_prints(pd.Series(0.0003, index=gap))
+    assert out_gap.iloc[-1] == pytest.approx(0.0003 * KAPPA)
+
+
+def test_trailing_funding_window_requires_full_calendar_window():
+    idx = pd.date_range("2025-01-01", periods=120, freq="8h", tz="UTC")  # 40 days
+    s = pd.Series(0.0003, index=idx)
+    out = fv.trailing_funding_ann_window(s, window_days=30.0)
+    assert out.loc[: idx[0] + pd.Timedelta(days=30) - pd.Timedelta(hours=1)].isna().all()
+    assert out.iloc[-1] == pytest.approx(0.0003 * KAPPA)
+    with pytest.raises(ValueError):
+        fv.trailing_funding_ann_window(s, window_days=0.0)
+
+
+def test_annualized_basis_nan_for_non_positive_prices():
+    assert np.isnan(fv.annualized_basis(0.0, 100.0, 0.5))
+    assert np.isnan(fv.annualized_basis(-1.0, 100.0, 0.5))
+
+
+def test_fair_perp_premium_guard():
+    with pytest.raises(ValueError):
+        fv.fair_perp_premium_ann(KAPPA + 1.0)
 
 
 def test_calendar_excess_sign():
