@@ -105,3 +105,32 @@ position); `live/history.py` duplicates `data/`; the testnet broker is exercised
 daemon checks the listing at each entry.
 
 Next entries: paper-live start date and first 14-day operations review.
+
+## 2026-10-18 — cost and latency diagnostics (no rule change)
+
+Question: the pre-registered cell makes no S1/S2/S4 trade since early 2025; is the binding constraint the
+rule, the cost of trading, or the timing of fills? Answered only with cells that already exist: the cost-tier
+and fill-lag cells of the §8 grid and the HMRW replication cells (`N_configs` unchanged). No threshold, cost
+assumption or rule changed. Report: `reports/cost_latency/summary.md` (`scripts/cost_latency_report.py`).
+
+* **Cost decides the short-horizon trade.** S4 (HMRW) at VIP0 taker cost (38 bp round trip) trades 8 / 10
+  times (BTC / ETH) with excess −1.36% / −0.40%; at HMRW's fee levels (4.9-16.4 bp) it trades 39-157 /
+  59-255 times with +1.37% to +3.29% / +3.28% to +5.22%. S2 is positive at every tier; S3 is negative at every
+  tier; S1 improves from +0.91% to +1.37% (BTC) between VIP0 and VIP3.
+* **These are fee cells, not maker cells.** Every tier keeps taker fills at the hourly close. A liquidity
+  provider earning such fees with resting quotes would also bear fill uncertainty, queue position and adverse
+  selection; none is measured here.
+* **Latency.** One-bar fill lag removes S1's edge (BTC +0.91% → −0.65%, ETH +0.24% → −0.60%) and leaves S2
+  unchanged (its input moves only at funding stamps). For BTC the entire S1 lag gap (−1,650 USDT) comes from
+  three bars: the first trading hours of `BTCUSDT_210326`, the 2021-04-18 quarterly wick, and the 2021-09-07
+  crash (−1,744 USDT; the other nine trips +94 USDT). For ETH the gap (−770 USDT) is spread more evenly (top
+  three trips −401 USDT). Read both ways: a late taker loses on extreme bars, and same-bar close fills are
+  optimistic exactly there.
+* **2026 year to date (290 days).** No sanctioned cell, HMRW replication cells included, beats the T-bill in
+  either root; S4 makes no trade even at HMRW fees and S2 one trade (BTC, HMRW-low). A fee advantage is
+  necessary for the short-horizon trade, not sufficient: in 2026 the dislocation itself was small.
+
+Candidate hypothesis for a v1.1 (not run, to be pre-registered before any result): quote S4 passively around
+the HMRW fair premium and measure fills by trade-through on 1-minute data plus post-fill markouts (adverse
+selection); evaluate on forward paper data recorded by the daemon (`SNAPSHOT` bid/ask every 60 s), not on the
+sample already seen.
