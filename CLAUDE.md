@@ -52,6 +52,7 @@ src/basis_arb/
   data/              Binance + FRED fetchers, parquet cache, panel builder (python -m basis_arb.data.panel)
   backtest/          engine, metrics, report, sensitivity, run (python -m basis_arb.backtest.run)
   live/              history, feed, state, broker (Paper / Testnet), daemon (python -m basis_arb.live.daemon)
+scripts/             cost_latency_report.py: diagnostics from existing grid cells -> reports/cost_latency/
 tests/               offline unit tests; conftest.make_panel is the synthetic panel generator
 docs/                strategy_spec, theory, data_sources, operations, research_log, NEXT
 data/ state/         gitignored runtime artefacts; reports/ holds committed backtest output

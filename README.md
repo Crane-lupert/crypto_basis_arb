@@ -1,13 +1,20 @@
 # crypto_basis_arb
 
+[한국어 README](README_kr.md)
+
 Theory-anchored basis trading on Binance: a **theoretical futures price** from the perpetual-futures
 pricing literature and the cost-of-carry relation, compared with the **market basis**, to enter and exit
 spot-vs-futures positions. Deterministic backtest engine, pre-registered rules, and a paper-live daemon
 with Binance testnet order routing.
 
-> Status: in progress — backtest engine and paper-live daemon implemented; the first pre-registered run
-> (spec v1.0.2) is being produced. No real capital has been traded through this code, and the code cannot
-> reach a real-money endpoint (see *Honesty and limits*).
+This is not a search for a new signal: the fair-value formulas come from published work and the rules are
+the simplest cost-hurdle rules, frozen before the first full-sample run. The work is in taking that research
+to a live-like stack (same signal code in backtest and daemon, closed-bar decisions, actual funding stamps,
+expiry and roll handling, fail-secure kill switches, testnet routing) and in reporting what the market paid.
+
+> Status: backtest of the pre-registered cell (spec v1.0.2) and cost/latency diagnostics complete; paper-live
+> daemon implemented and smoke-tested, continuous paper operation not yet logged. No real capital has been
+> traded through this code, and the code cannot reach a real-money endpoint (see *Honesty and limits*).
 
 ## What it does
 
@@ -77,6 +84,33 @@ What the numbers say:
   cost tiers, four buffers and three windows are in the sensitivity grid (`N_configs` = 12 per strategy plus
   3 replication cells); the pre-registered cell is not the best cell.
 <!-- RESULTS:END -->
+
+## Who earns the basis: cost and latency
+
+Backtest diagnostics from cells that already exist in the sanctioned grid (no rule, threshold or cost
+assumption changed): [`reports/cost_latency/summary.md`](reports/cost_latency/summary.md) (commit `454937d`).
+
+![excess return vs round-trip cost](reports/cost_latency/fee_curve.png)
+
+* **Cost decides the short-horizon trade.** HMRW's random-maturity rule (S4) loses against the T-bill at a
+  retail taker's 38 bp round trip (8 / 10 round trips, excess −1.36% / −0.40% for BTC / ETH). At HMRW's fee
+  levels (4.9-16.4 bp) the same rule trades 39-157 / 59-255 times with excess +1.37% to +3.29% / +3.28% to
+  +5.22% per year. The signal is the same; the cost of crossing the spread decides whether it pays.
+* **Those cells lower the fee, not the execution risk.** They keep taker fills at the hourly close. Earning
+  such fees by quoting passively, as a liquidity provider does, adds fill uncertainty, queue position and
+  adverse selection, which this backtest does not measure (next step below).
+* **Latency.** Filling one hourly bar later removes S1's edge (BTC +0.91% → −0.65%, ETH +0.24% → −0.60%) and
+  leaves S2 unchanged. For BTC the whole S1 gap comes from three extreme bars (first trading hours of a new
+  quarterly, the 2021-04-18 quarterly wick, the 2021-09-07 crash); for ETH it is spread more evenly. A late
+  taker loses on exactly the bars where same-bar close fills are least credible.
+* **A fee advantage is necessary, not sufficient.** In 2026 to date no sanctioned cell beats the T-bill in
+  either root, HMRW replication cells included. S4 makes no trade even at HMRW fees: the perpetual closed
+  above spot in 0.4% / 0.1% of 2026 hours (median gap −4.7 / −4.8 bp), and S4 can only sell a premium.
+
+Next step (not run; to be pre-registered before any result, `docs/research_log.md`): quote S4 passively around
+the HMRW fair premium, measure fills by trade-through on 1-minute data and adverse selection by post-fill
+markouts, and evaluate on forward bid/ask snapshots recorded by the paper daemon rather than on the sample
+already seen.
 
 ## Quick start
 
