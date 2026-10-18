@@ -9,6 +9,7 @@ Reads the committed sensitivity grids (`reports/{ROOT}/sensitivity.csv`) and the
 3. the S1 fill-lag gap decomposed per round trip, with the one-hour basis move at the decision bars
 4. one calendar year (default 2026, year to date) of every sanctioned cell: full-sample runs, sliced, so a
    position entered earlier is carried into the year exactly as in the full run
+5. perpetual vs spot at hourly closes by year, and how often S4's entry condition holds at VIP0 / HMRW-low cost
 
 Usage:
     python scripts/cost_latency_report.py --roots BTCUSDT ETHUSDT --out reports/cost_latency
@@ -30,7 +31,9 @@ import pandas as pd  # noqa: E402
 from basis_arb.backtest import metrics as mt  # noqa: E402
 from basis_arb.backtest import sensitivity as sens  # noqa: E402
 from basis_arb.backtest.engine import prepare_panel, run_backtest  # noqa: E402
-from basis_arb.config import BacktestConfig  # noqa: E402
+from basis_arb.config import KAPPA, BacktestConfig  # noqa: E402
+from basis_arb.model import fair_value as fv  # noqa: E402
+from basis_arb.model import signals  # noqa: E402
 from basis_arb.types import STRATEGIES, STRATEGY_LEGS  # noqa: E402
 
 LABELS = {"cash_and_carry": "S1 cash-and-carry", "funding_carry": "S2 funding carry",
@@ -190,6 +193,24 @@ def year_slice(panel: pd.DataFrame, prep, root: str, base_cfg: BacktestConfig, y
     return pd.DataFrame(rows)
 
 
+def premium_by_year(panel: pd.DataFrame, root: str, cfg: BacktestConfig) -> pd.DataFrame:
+    """Perpetual vs spot at hourly closes: median ln(P/S) in bp and the share of bars where S4's entry condition
+    (premium deviation above the upper band edge) holds at VIP0 and at HMRW-low cost."""
+    p = signals.enrich(panel, cfg)
+    p = p[~p["stale_bar"]] if "stale_bar" in p else p
+    legs = tuple(leg for leg, _ in STRATEGY_LEGS["random_maturity"])
+    upper = {t: fv.no_arb_band_ann(sens.ALL_TIERS[t].round_trip_frac(legs), KAPPA)[1] for t in ("VIP0", "HMRW-low")}
+    rows = []
+    for year, d in p.groupby(p.index.year):
+        dev = d["rm_dev_ann"].dropna()
+        rows.append({"root": root, "year": int(year),
+                     "median perp-spot gap (bp)": f"{np.median(d['perp_prem_ann'].dropna()) / KAPPA * 1e4:+.1f}",
+                     "bars with perp above spot": pct((d["perp_close"] > d["spot_close"]).mean(), 1),
+                     "bars above band, VIP0": pct((dev > upper["VIP0"]).mean(), 3),
+                     "bars above band, HMRW-low": pct((dev > upper["HMRW-low"]).mean(), 3)})
+    return pd.DataFrame(rows)
+
+
 def year_summary(ys: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (root, s, kind), d in ys.groupby(["root", "strategy", "kind"], sort=False):
@@ -230,12 +251,13 @@ def main() -> None:
     plot_cost_curve(cc, out / "fee_curve.png")
     lag = lag_table(grids, base)
 
-    decomp, years = {}, []
+    decomp, years, prem = {}, [], []
     for root in args.roots:
         panel = pd.read_parquet(Path(args.data) / f"panel_{root}_1h.parquet")
         prep = prepare_panel(panel)
         decomp[root] = s1_lag_decomposition(panel, prep, root, cfg)
         years.append(year_slice(panel, prep, root, cfg, args.year))
+        prem.append(premium_by_year(panel, root, cfg))
     ys = pd.concat(years, ignore_index=True)
     ys.to_csv(out / f"year_{args.year}_cells.csv", index=False)
     cc.to_csv(out / "cost_curve.csv", index=False)
@@ -299,6 +321,12 @@ def main() -> None:
               "period sums, not annualized; excess deducts the T-bill on committed capital, flat days included.",
               f"Per-cell rows: `year_{args.year}_cells.csv`.", "",
               md_table(year_summary(ys)), ""]
+
+    lines += ["## 5. Perpetual vs spot at hourly closes, by year", "",
+              "S4 sells a perpetual premium (long spot / short perpetual); the reverse needs a short spot leg and is off",
+              "(spec section 5). `bars above band` = share of non-stale hourly bars where the premium deviation",
+              "`rho - rho*` exceeds the upper edge `kappa * ln(1 + C)` of the no-arbitrage band at that cost tier.", "",
+              md_table(pd.concat(prem, ignore_index=True)), ""]
     (out / "summary.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"wrote {out / 'summary.md'} and {out / 'fee_curve.png'}")
 
